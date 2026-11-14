@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
 import { GitRepoStore, parseCommit, sha1Object, parseTree, packEncode, packDecode } from './gitstore.ts';
+import { executeGraphQL } from './graphql.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -254,60 +255,18 @@ export function createApp(): Server {
         sendJson(res, 400, { message: 'Malformed JSON' });
         return;
       }
-
+      const gqlCtx = {
+        repos, issuesMap, pullsMap, labelsMap, nowIso,
+        viewerLogin: VIEWER_LOGIN, getRepoKey,
+        nextIssueId: () => issueIdCounter++,
+        nextPullId: () => pullIdCounter++,
+        nextCommentId: () => commentIdCounter++
+      };
       const queries = Array.isArray(payload) ? payload : [payload];
       const results: any[] = [];
-
       for (const q of queries) {
-        const queryStr = q.query || '';
-        const data: any = {};
-        const errors: any[] = [];
-
-        if (queryStr.includes('viewer')) {
-          data.viewer = { login: VIEWER_LOGIN, id: 'U_1' };
-        }
-        if (queryStr.includes('repository(')) {
-          const ownerMatch = queryStr.match(/owner:\s*"([^"]+)"/);
-          const nameMatch = queryStr.match(/name:\s*"([^"]+)"/);
-          if (ownerMatch && nameMatch) {
-            const repoKey = getRepoKey(ownerMatch[1], nameMatch[1]);
-            const repo = repos.get(repoKey);
-            if (!repo) {
-              data.repository = null;
-            } else {
-              data.repository = {
-                id: 'R_' + repo.name,
-                name: repo.name,
-                owner: { login: repo.owner },
-                issues: {
-                  nodes: (issuesMap.get(repoKey) || []).map(i => ({
-                    id: 'I_' + i.id,
-                    number: i.number,
-                    title: i.title,
-                    state: i.state.toUpperCase()
-                  }))
-                }
-              };
-            }
-          }
-        }
-
-        if (queryStr.includes('__schema') || queryStr.includes('__type')) {
-          data.__schema = {
-            types: [
-              { name: 'Issue' },
-              { name: 'PullRequest' },
-              { name: 'Repository' },
-              { name: 'SearchType' }
-            ]
-          };
-        }
-
-        const resObj: any = { data };
-        if (errors.length > 0) resObj.errors = errors;
-        results.push(resObj);
+        results.push(executeGraphQL(q.query || '', q.variables || {}, gqlCtx));
       }
-
       sendJson(res, 200, Array.isArray(payload) ? results : results[0]);
       return;
     }
