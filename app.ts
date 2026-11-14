@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
+import { GitRepoStore, parseCommit } from './gitstore.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -143,11 +144,7 @@ interface Repo {
   createdAt: string;
   updatedAt: string;
   description: string | null;
-  gitObjects: Map<string, Buffer>;
-  refs: Map<string, string>;
-  packCache: Map<string, Buffer>;
-  branchFiles?: Map<string, Map<string, string>>;
-  commitFiles?: Map<string, Map<string, string>>;
+  store: GitRepoStore;
 }
 
 interface Issue {
@@ -362,10 +359,10 @@ export function createApp(): Server {
           const repo: Repo = {
             id: repoId,
             owner, name, private: false, defaultBranch: 'main', createdAt: now, updatedAt: now, description: null,
-            gitObjects: new Map(), refs: new Map(), packCache: new Map(), branchFiles: new Map(), commitFiles: new Map()
+            store: new GitRepoStore()
           };
           repos.set(repoKey, repo);
-          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify(repo) }] }, id });
+          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify({ id: repo.id, name: repo.name, full_name: repo.owner + '/' + repo.name, private: repo.private, default_branch: repo.defaultBranch, owner: { login: repo.owner } }) }] }, id });
           return;
         }
 
@@ -440,8 +437,8 @@ export function createApp(): Server {
             return;
           }
           const repoPulls = pullsMap.get(repoKey) || [];
-          const headSha = repo.refs.get('refs/heads/' + args.head) || '0000000000000000000000000000000000000000';
-          const baseSha = repo.refs.get('refs/heads/' + args.base) || '0000000000000000000000000000000000000000';
+          const headSha = repo.store.refs.get('refs/heads/' + args.head) || '0000000000000000000000000000000000000000';
+          const baseSha = repo.store.refs.get('refs/heads/' + args.base) || '0000000000000000000000000000000000000000';
           const now = nowIso();
           const newPull: Pull = {
             id: pullIdCounter++,
@@ -486,7 +483,12 @@ export function createApp(): Server {
             sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Already merged or closed' }], isError: true }, id });
             return;
           }
-          const commitSha = crypto.createHash('sha1').update(`squash-mcp-${pull.id}-${nowIso()}`).digest('hex');
+          const baseTip = repo.store.refs.get('refs/heads/' + pull.base.ref) || '0000000000000000000000000000000000000000';
+          const headFiles = repo.store.commitFileMap(pull.head.sha);
+          const mergeTree = repo.store.writeTreeFromMap(headFiles);
+          const commitSha = repo.store.writeCommit(mergeTree, baseTip === '0000000000000000000000000000000000000000' ? [] : [baseTip], `Squash merge PR #${pull.number}: ${pull.title}`);
+          repo.store.commitFiles.set(commitSha, new Map(headFiles));
+          repo.store.branchFiles.set(pull.base.ref, new Map<string, Buffer>(headFiles));
           pull.state = 'closed';
           pull.merged = true;
           const mergedAtTime = nowIso();
@@ -494,7 +496,7 @@ export function createApp(): Server {
           pull.merge_commit_sha = commitSha;
           pull.updatedAt = mergedAtTime;
 
-          repo.refs.set('refs/heads/' + pull.base.ref, commitSha);
+          repo.store.refs.set('refs/heads/' + pull.base.ref, commitSha);
           sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify({ sha: commitSha, merged: true, message: `Merged PR #${pull.number}` }) }] }, id });
           return;
         }
@@ -696,7 +698,7 @@ export function createApp(): Server {
           id: repoId,
           owner, name, private: body.private ?? false, defaultBranch: body.default_branch || 'main',
           createdAt: now, updatedAt: now, description: body.description || null,
-          gitObjects: new Map(), refs: new Map(), packCache: new Map(), branchFiles: new Map(), commitFiles: new Map()
+          store: new GitRepoStore()
         };
         repos.set(repoKey, newRepo);
         sendJson(res, 201, {
@@ -994,8 +996,8 @@ export function createApp(): Server {
             const headRefName = typeof headInput === 'string' ? headInput : (headInput?.ref || repo.defaultBranch);
             const baseRefName = typeof baseInput === 'string' ? baseInput : (baseInput?.ref || repo.defaultBranch);
 
-            const headSha = repo.refs.get('refs/heads/' + headRefName) || '0000000000000000000000000000000000000000';
-            const baseSha = repo.refs.get('refs/heads/' + baseRefName) || '0000000000000000000000000000000000000000';
+            const headSha = repo.store.refs.get('refs/heads/' + headRefName) || '0000000000000000000000000000000000000000';
+            const baseSha = repo.store.refs.get('refs/heads/' + baseRefName) || '0000000000000000000000000000000000000000';
 
             const now = nowIso();
             const newPull: Pull = {
@@ -1066,7 +1068,12 @@ export function createApp(): Server {
                 return;
               }
 
-              const commitSha = crypto.createHash('sha1').update(`squash-${pull.id}-${nowIso()}`).digest('hex');
+              const baseTip = repo.store.refs.get('refs/heads/' + pull.base.ref) || '0000000000000000000000000000000000000000';
+              const headFiles = repo.store.commitFileMap(pull.head.sha);
+              const mergeTree = repo.store.writeTreeFromMap(headFiles);
+              const commitSha = repo.store.writeCommit(mergeTree, baseTip === '0000000000000000000000000000000000000000' ? [] : [baseTip], `Squash merge PR #${pull.number}: ${pull.title}`);
+              repo.store.commitFiles.set(commitSha, new Map(headFiles));
+              repo.store.branchFiles.set(pull.base.ref, new Map<string, Buffer>(headFiles));
               pull.state = 'closed';
               pull.merged = true;
               const mergedAtTime = nowIso();
@@ -1074,10 +1081,7 @@ export function createApp(): Server {
               pull.merge_commit_sha = commitSha;
               pull.updatedAt = mergedAtTime;
 
-              repo.refs.set('refs/heads/' + pull.base.ref, commitSha);
-              if (repo.branchFiles && repo.branchFiles.has(pull.head.ref)) {
-                repo.branchFiles.set(pull.base.ref, new Map(repo.branchFiles.get(pull.head.ref)!));
-              }
+              repo.store.refs.set('refs/heads/' + pull.base.ref, commitSha);
 
               sendJson(res, 200, {
                 sha: commitSha,
