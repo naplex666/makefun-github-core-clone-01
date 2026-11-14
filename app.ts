@@ -6,6 +6,7 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 
 // Deterministic RNG / Viewer Computation (FNV-1a 64-bit + splitmix64 + xorshift64*)
 const SCENARIO_SEED = 0x6a09e667f3bcc909n;
+const U64_MASK = 0xffffffffffffffffn;
 
 function fnv1a64(str: string): bigint {
   let hash = 0xcbf29ce484222325n;
@@ -13,55 +14,60 @@ function fnv1a64(str: string): bigint {
     hash ^= BigInt(str.charCodeAt(i));
     hash *= 0x100000001b3n;
   }
-  return hash;
+  return hash & U64_MASK;
 }
 
-function splitmix64(state: { x: bigint }): bigint {
-  state.x += 0x9e3779b97f4a7c15n;
-  let z = state.x;
-  z = (z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n;
-  z = (z ^ (z >> 27n)) * 0x94d049bb133111ebn;
-  return z ^ (z >> 31n);
+function mix64(value: bigint): bigint {
+  let z = (value + 0x9e3779b97f4a7c15n) & U64_MASK;
+  z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & U64_MASK;
+  z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & U64_MASK;
+  return (z ^ (z >> 31n)) & U64_MASK;
 }
 
 class Xorshift64Star {
-  state: bigint;
+  #state: bigint;
   constructor(seed: bigint) {
-    this.state = seed === 0n ? 0x123456789abcdef0n : seed;
+    const masked = seed & U64_MASK;
+    this.#state = masked === 0n ? SCENARIO_SEED : masked;
   }
-  nextBigInt(): bigint {
-    let x = this.state;
-    x ^= x >> 12n;
-    x ^= x << 25n;
-    x ^= x >> 27n;
-    this.state = x;
-    return x * 0x2545f4914f6cdd1dn;
+  nextU64(): bigint {
+    let x = this.#state;
+    x = (x ^ (x >> 12n)) & U64_MASK;
+    x = (x ^ (x << 25n)) & U64_MASK;
+    x = (x ^ (x >> 27n)) & U64_MASK;
+    this.#state = x;
+    return (x * 0x2545f4914f6cdd1dn) & U64_MASK;
   }
-  nextFloat(): number {
-    return Number(this.nextBigInt() & 0xfffffffffffffn) / 4503599627370496;
+  nextU32(): number {
+    return Number(this.nextU64() >> 32n);
   }
-  nextInt(max: number): number {
-    return Math.floor(this.nextFloat() * max);
+  nextInt(maxExclusive: number): number {
+    if (maxExclusive <= 1) return 0;
+    const range = 4294967296;
+    const limit = range - (range % maxExclusive);
+    for (;;) {
+      const value = this.nextU32();
+      if (value < limit) return value % maxExclusive;
+    }
+  }
+  pick<T>(items: readonly T[]): T {
+    return items[this.nextInt(items.length)];
   }
 }
 
-function scenarioRng(name: string): Xorshift64Star {
-  const seed = fnv1a64(name) ^ SCENARIO_SEED;
-  const smState = { x: seed };
-  const s1 = splitmix64(smState);
-  const s2 = splitmix64(smState);
-  return new Xorshift64Star((s1 << 32n) | s2);
+function scenarioRng(label: string): Xorshift64Star {
+  return new Xorshift64Star(mix64(SCENARIO_SEED ^ fnv1a64(label)));
 }
 
 const FIRST_NAMES = ['ada', 'bram', 'cora', 'dmitri', 'elena', 'felix', 'greta', 'hugo', 'iris', 'jonas', 'kira', 'lars', 'mira', 'nico', 'olga', 'pavel', 'quinn', 'rosa', 'sven', 'tess', 'ulla', 'vito', 'wren', 'yara', 'zane'];
-const LAST_NAMES = ['anders', 'bauer', 'costa', 'dahl', 'eriksen', 'fischer', 'garcia', 'holm', 'iversen', 'jensen', 'keller', 'larsen', 'moen', 'nielsen', 'olsen', 'pedersen', 'quist', 'rasmussen', 'svendsen', 'thomsen', 'underwood', 'voss', 'witt', 'young', 'zeiger'];
+const LAST_NAMES = ['anders', 'bauer', 'costa', 'dahl', 'eriksen', 'fischer', 'garcia', 'holm', 'iversen', 'jensen', 'keller', 'lind', 'moreau', 'novak', 'olsen', 'peters', 'quist', 'rossi', 'sato', 'turi', 'ulrich', 'vega', 'weber', 'xu', 'yilmaz', 'zimmer'];
 
 function generateUsers(rng: Xorshift64Star, count: number): { login: string; id: number }[] {
   const used = new Set<string>();
   const users: { login: string; id: number }[] = [];
   for (let i = 0; i < count; i++) {
-    const first = FIRST_NAMES[rng.nextInt(FIRST_NAMES.length)];
-    const last = LAST_NAMES[rng.nextInt(LAST_NAMES.length)];
+    const first = rng.pick(FIRST_NAMES);
+    const last = rng.pick(LAST_NAMES);
     const base = `${first}${last}`.replace(/[^a-z0-9-]/g, '');
     let login = base;
     let suffix = 2;
@@ -594,10 +600,63 @@ export function createApp(): Server {
           });
           return;
         }
+        if (!sub && method === 'PATCH') {
+          const bodyBuf = await readBody(req);
+          let body: any = {};
+          try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+          if (body.description !== undefined) repo.description = body.description;
+          if (body.private !== undefined) repo.private = body.private;
+          repo.updatedAt = nowIso();
+          sendJson(res, 200, {
+            id: 5000,
+            node_id: 'R_' + repo.name,
+            name: repo.name,
+            full_name: `${repo.owner}/${repo.name}`,
+            private: repo.private,
+            owner: { login: repo.owner, id: 1000 },
+            default_branch: repo.defaultBranch,
+            description: repo.description,
+            created_at: repo.createdAt,
+            updated_at: repo.updatedAt
+          });
+          return;
+        }
         if (!sub && method === 'DELETE') {
           repos.delete(repoKey);
           res.writeHead(204, { 'x-github-request-id': nextReqId() });
           res.end();
+          return;
+        }
+
+        if (sub === 'branches' && method === 'GET') {
+          const branches: any[] = [];
+          for (const [refName, oid] of repo.refs.entries()) {
+            if (refName.startsWith('refs/heads/')) {
+              const name = refName.replace('refs/heads/', '');
+              branches.push({ name, commit: { sha: oid } });
+            }
+          }
+          if (branches.length === 0) {
+            branches.push({ name: repo.defaultBranch, commit: { sha: '0000000000000000000000000000000000000000' } });
+          }
+          sendJson(res, 200, branches);
+          return;
+        }
+
+        if (sub === 'commits' && method === 'GET') {
+          const commits: any[] = [];
+          for (const [oid, content] of repo.gitObjects.entries()) {
+            if (content.toString().startsWith('commit ')) {
+              commits.push({
+                sha: oid,
+                commit: {
+                  message: 'Commit message',
+                  author: { name: VIEWER_LOGIN, email: `${VIEWER_LOGIN}@example.invalid`, date: repo.createdAt }
+                }
+              });
+            }
+          }
+          sendJson(res, 200, commits);
           return;
         }
 
@@ -627,15 +686,26 @@ export function createApp(): Server {
 
         if (sub === 'issues') {
           const issueNumOrSub = urlParts[6];
+          const commentSub = urlParts[7];
           const repoIssues = issuesMap.get(repoKey) || [];
 
           if (!issueNumOrSub && method === 'GET') {
-            const state = searchParamsOf(req).get('state') || 'open';
-            const filtered = repoIssues.filter(i => state === 'all' || i.state === state);
+            const params = searchParamsOf(req);
+            const state = params.get('state') || 'open';
+            const sort = params.get('sort') || 'created';
+            const direction = params.get('direction') || 'desc';
+
+            let filtered = repoIssues.filter(i => state === 'all' || i.state === state);
+            filtered.sort((a, b) => {
+              const comp = a.createdAt.localeCompare(b.createdAt);
+              return direction === 'asc' ? comp : -comp;
+            });
+
             const formatted = filtered.map(i => ({
               ...i,
               user: { login: i.user, id: 1000 },
-              labels: i.labels.map(l => ({ name: l }))
+              labels: i.labels.map(l => ({ name: l })),
+              comments: i.comments.length
             }));
             sendJson(res, 200, formatted);
             return;
@@ -679,6 +749,73 @@ export function createApp(): Server {
               labels: newIssue.labels.map(l => ({ name: l }))
             });
             return;
+          }
+
+          // Specific issue operations: /issues/{n} or /issues/{n}/comments
+          if (issueNumOrSub && !isNaN(Number(issueNumOrSub))) {
+            const issueNum = Number(issueNumOrSub);
+            const issue = repoIssues.find(i => i.number === issueNum);
+            if (!issue) {
+              sendJson(res, 404, { message: 'Issue not found' });
+              return;
+            }
+
+            if (!commentSub && method === 'GET') {
+              sendJson(res, 200, {
+                ...issue,
+                user: { login: issue.user, id: 1000 },
+                labels: issue.labels.map(l => ({ name: l })),
+                comments: issue.comments.length
+              });
+              return;
+            }
+
+            if (!commentSub && method === 'PATCH') {
+              const bodyBuf = await readBody(req);
+              let body: any = {};
+              try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+
+              if (body.state) issue.state = body.state;
+              if (body.title) issue.title = body.title;
+              if (body.body !== undefined) issue.body = body.body;
+              issue.updatedAt = nowIso();
+
+              sendJson(res, 200, {
+                ...issue,
+                user: { login: issue.user, id: 1000 },
+                labels: issue.labels.map(l => ({ name: l }))
+              });
+              return;
+            }
+
+            if (commentSub === 'comments') {
+              if (method === 'GET') {
+                const formattedComments = issue.comments.map(c => ({
+                  ...c,
+                  user: { login: c.user, id: 1000 }
+                }));
+                sendJson(res, 200, formattedComments);
+                return;
+              }
+              if (method === 'POST') {
+                const bodyBuf = await readBody(req);
+                let body: any = {};
+                try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+
+                const newComment: Comment = {
+                  id: commentIdCounter++,
+                  body: body.body || '',
+                  user: VIEWER_LOGIN,
+                  createdAt: nowIso()
+                };
+                issue.comments.push(newComment);
+                sendJson(res, 201, {
+                  ...newComment,
+                  user: { login: newComment.user, id: 1000 }
+                });
+                return;
+              }
+            }
           }
         }
       }
