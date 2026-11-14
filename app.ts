@@ -691,6 +691,7 @@ export function createApp(): Server {
         // v2 fetch or v0 fetch
         let wants: string[] = [];
         let haves: string[] = [];
+        let requestedShallow: string[] = [];
         let deepenDepth = 0;
         let isFetchCommand = firstText.startsWith('command=fetch');
 
@@ -705,6 +706,8 @@ export function createApp(): Server {
             haves.push(parts[0]);
           } else if (t.startsWith('deepen ')) {
             deepenDepth = parseInt(t.slice(7).trim(), 10) || 0;
+          } else if (t.startsWith('shallow ')) {
+            requestedShallow.push(t.slice(8).trim());
           }
         }
 
@@ -750,7 +753,8 @@ export function createApp(): Server {
           }
         }
 
-        // Subtract haves if any
+        // Subtract haves if any: the FULL closure (commits + trees + blobs),
+        // exactly like the want-walk, so already-held objects are never re-sent.
         if (haves.length > 0) {
           const haveReachable = new Set<string>();
           const hQueue = [...haves];
@@ -763,7 +767,17 @@ export function createApp(): Server {
             if (obj.type === 'commit') {
               try {
                 const parsed = parseCommit(obj.data);
+                if (parsed.tree) hQueue.push(parsed.tree);
                 for (const pOid of parsed.parents) hQueue.push(pOid);
+              } catch {}
+            } else if (obj.type === 'tree') {
+              try {
+                for (const entry of parseTree(obj.data)) hQueue.push(entry.oid);
+              } catch {}
+            } else if (obj.type === 'tag') {
+              try {
+                const m = obj.data.toString('utf8').match(/^object\s+([0-9a-f]{40})/m);
+                if (m) hQueue.push(m[1]);
               } catch {}
             }
           }
@@ -804,9 +818,22 @@ export function createApp(): Server {
           responseChunks.push(Buffer.from('0001')); // delim: end of acknowledgments
           if (deepenDepth > 0) {
             responseChunks.push(Buffer.from(pktLine('shallow-info\n')));
-            for (const w of wants) {
-              const obj = repo.store.objects.get(w);
-              if (obj && obj.type === 'commit') responseChunks.push(Buffer.from(pktLine(`shallow ${w}\n`)));
+            // Boundary commits: the ones at exactly the deepen depth (their
+            // parents were cut off). commitDepths was built during the walk.
+            for (const [oid, depth] of commitDepths) {
+              if (depth === deepenDepth && visitedObjects.has(oid)) {
+                const obj = repo.store.objects.get(oid);
+                if (obj && obj.type === 'commit') responseChunks.push(Buffer.from(pktLine(`shallow ${oid}\n`)));
+              }
+            }
+            // Unshallow: a previously-shallow commit whose parent we delivered.
+            for (const s of requestedShallow) {
+              const obj = repo.store.objects.get(s);
+              if (!obj || obj.type !== 'commit') continue;
+              try {
+                const parsed = parseCommit(obj.data);
+                if (parsed.parents.some((p: string) => visitedObjects.has(p))) responseChunks.push(Buffer.from(pktLine(`unshallow ${s}\n`)));
+              } catch {}
             }
             responseChunks.push(Buffer.from('0001')); // delim: end of shallow-info
           }
