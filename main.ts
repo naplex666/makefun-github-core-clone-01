@@ -1,20 +1,21 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// The environment lifecycle wiring, coordinated via env/src/wire.ts: open a local ephemeral socket,
+// transmit the bound port number to the backend service, then poll until the backend signals completion
+// and exit with code zero. Preserve the exact behavior here: this wrapper is provided by the harness.
 //
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
+//   1. MAKEFUN_ENV_URL defines the target service base (http://store:8080 in container test setups).
+//      Without it, communication is impossible, leading to an immediate exit with code 1.
+//   2. Instantiate the local server and invoke listen(0) to allocate an available port dynamically.
+//      Never use port 8080 directly as the test harness controls that endpoint.
+//   3. Perform a POST request to $MAKEFUN_ENV_URL/register with JSON payload {"port": N}. The orchestrator
+//      captures the remote socket origin combined with N to form the base URL for callbacks.
+//      The initial registration succeeds; HTTP 409 indicates another worker beat us to it, and this process
+//      continues waiting normally.
+//   4. Repeatedly query GET $MAKEFUN_ENV_URL/done until the parsed response JSON equals {"done": true}.
+//      The harness responds immediately with {"done": false} while tests execute, functioning as a poll.
+//      Timeouts or dropped queries trigger brief exponential backoffs; execution never aborts prematurely.
+//   5. Terminate the HTTP listener and exit cleanly with code 0, allowing the harness to capture outputs.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// main.ts imports only createApp from ./app.ts and relies solely on standard runtime APIs.
 
 import { createApp } from './app.ts';
 
@@ -24,23 +25,22 @@ if (ENV_URL === '') {
   process.exit(1);
 }
 
-/** How long one register or done request may take before it is abandoned and retried. */
+/** Maximum duration allocated for a single registration or poll request before timing out. */
 const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
+/** Initial pause interval for retry delays, along with the ceiling limit. */
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
+/** Calculate the backoff delay following failed attempts using exponential progression. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
 }
 
 /**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
- * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
+ * Transmit the bound listener port via POST until acknowledged. HTTP 200 and 409 are accepted
+ * as successful outcomes; HTTP 400 and 405 are fatal protocol errors that terminate execution.
  */
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
@@ -60,7 +60,7 @@ async function register(port: number): Promise<void> {
   }
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
+/** Query GET /done repeatedly until the returned JSON indicates completion. */
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -70,13 +70,13 @@ async function waitForDone(): Promise<void> {
         if (body.done === true) return;
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // Backend not yet ready or request timed out; safely ignore and retry.
     }
     await sleep(retryDelay(attempt));
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
+/** Initialize the application server, bind a dynamic port, register, and await completion. */
 async function main(): Promise<void> {
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
