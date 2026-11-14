@@ -284,26 +284,10 @@ export function packDecode(packBuf: Buffer, externalObjects?: Map<string, { type
       }
     }
 
-    // Determine actual bytes consumed by zlib stream
-    // zlib.inflateSync doesn't tell us how many bytes it read, but we can check with a streaming inflate or estimate.
-    // Alternatively, zlib.inflateSync processes the valid zlib stream. We can find the exact bytes consumed by feeding chunks or using zlib.Unzip / Inflate.
-    // Let's use zlib.inflateSync with chunk or find length:
-    let consumed = 1;
-    for (let l = 1; l <= packBuf.length - offset; l++) {
-      try {
-        const sub = packBuf.subarray(offset, offset + l);
-        const inf = zlib.inflateSync(sub);
-        if (typeNum === 6 || typeNum === 7) {
-          inflatedData = inf;
-          consumed = l;
-          break;
-        } else if (inf.length === size) {
-          inflatedData = inf;
-          consumed = l;
-          break;
-        }
-      } catch {}
-    }
+    // The binary search above already found the smallest slice that inflates
+    // (zlib.inflateSync ignores trailing bytes and throws on a truncated
+    // stream), so bestLen IS the exact stream length. No linear scan needed.
+    const consumed = bestLen;
     offset += consumed;
 
     let finalType: GitObjectType = 'blob';

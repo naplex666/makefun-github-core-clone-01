@@ -332,7 +332,7 @@ export function createApp(): Server {
         return;
       }
       if (methodRpc === 'initialize') {
-        sendJson(res, 200, { jsonrpc: '2.0', result: { protocolVersion: '2026-07-28', capabilities: {}, serverInfo: { name: 'forge', version: '1.0' } }, id });
+        sendJson(res, 200, { jsonrpc: '2.0', result: { protocolVersion: '2026-07-28', capabilities: { tools: {} }, serverInfo: { name: 'forge', version: '1.0' } }, id });
         return;
       }
       if (methodRpc === 'notifications/initialized') {
@@ -951,7 +951,7 @@ export function createApp(): Server {
       if (resource === 'user' && urlParts[3] === 'repos' && method === 'POST') {
         const bodyBuf = await readBody(req);
         let body: any = {};
-        try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+        try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch { sendJson(res, 400, { message: 'Malformed JSON body' }); return; }
 
         const name = body.name;
         if (!name) {
