@@ -773,7 +773,15 @@ export function createApp(): Server {
           if (obj) encodeMap.set(oid, obj);
         }
 
-        const packBytes = packEncode(encodeMap);
+        // The pack for (wants, haves, deepen) is deterministic and immutable,
+        // so cache it: 50 shallow clones of one tip share one pack build.
+        const cacheKey = [...wants].sort().join(',') + '|' + [...haves].sort().join(',') + '|d' + deepenDepth;
+        const allWantsPresent = wants.length > 0 && wants.every((w: string) => repo.store.objects.has(w));
+        let packBytes = allWantsPresent ? repo.store.packCache.get(cacheKey) : undefined;
+        if (!packBytes) {
+          packBytes = packEncode(encodeMap);
+          if (allWantsPresent) repo.store.packCache.set(cacheKey, packBytes);
+        }
 
         const responseChunks: Buffer[] = [];
         if (isFetchCommand) {
