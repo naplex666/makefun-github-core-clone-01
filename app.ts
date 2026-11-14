@@ -690,13 +690,14 @@ export function createApp(): Server {
         // Compute object closure
         const visitedObjects = new Set<string>();
         const walkQueue = [...wants];
+        let walkHead = 0;
 
         // If deepenDepth is set, limit commit parent traversal
         const commitDepths = new Map<string, number>();
         for (const w of wants) commitDepths.set(w, 1);
 
-        while (walkQueue.length > 0) {
-          const oid = walkQueue.shift()!;
+        while (walkHead < walkQueue.length) {
+          const oid = walkQueue[walkHead++];
           if (visitedObjects.has(oid)) continue;
           const obj = repo.store.objects.get(oid);
           if (!obj) continue;
@@ -734,8 +735,9 @@ export function createApp(): Server {
         if (haves.length > 0) {
           const haveReachable = new Set<string>();
           const hQueue = [...haves];
-          while (hQueue.length > 0) {
-            const hOid = hQueue.shift()!;
+          let hHead = 0;
+          while (hHead < hQueue.length) {
+            const hOid = hQueue[hHead++];
             if (haveReachable.has(hOid)) continue;
             haveReachable.add(hOid);
             const obj = repo.store.objects.get(hOid);

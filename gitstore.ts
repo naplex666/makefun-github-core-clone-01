@@ -436,18 +436,25 @@ export class GitRepoStore {
 
   isAncestor(commitOid: string, ancestorOid: string): boolean {
     if (commitOid === ancestorOid) return true;
-    const visited = new Set<string>();
+    const obj = this.objects.get(commitOid);
+    if (obj && obj.type === 'commit') {
+      const commit = parseCommit(obj.data);
+      if (commit.parents.includes(ancestorOid)) return true;
+    }
+    const visited = new Set<string>([commitOid]);
     const queue = [commitOid];
-    while (queue.length > 0) {
-      const curr = queue.shift()!;
+    let head = 0;
+    while (head < queue.length) {
+      const curr = queue[head++];
       if (curr === ancestorOid) return true;
-      if (visited.has(curr)) continue;
-      visited.add(curr);
-      const obj = this.objects.get(curr);
-      if (obj && obj.type === 'commit') {
-        const commit = parseCommit(obj.data);
+      const cObj = this.objects.get(curr);
+      if (cObj && cObj.type === 'commit') {
+        const commit = parseCommit(cObj.data);
         for (const p of commit.parents) {
-          queue.push(p);
+          if (!visited.has(p)) {
+            visited.add(p);
+            queue.push(p);
+          }
         }
       }
     }
@@ -457,8 +464,9 @@ export class GitRepoStore {
   mergeBase(oid1: string, oid2: string): string | null {
     const ancestors1 = new Set<string>();
     const queue = [oid1];
-    while (queue.length > 0) {
-      const curr = queue.shift()!;
+    let head = 0;
+    while (head < queue.length) {
+      const curr = queue[head++];
       if (ancestors1.has(curr)) continue;
       ancestors1.add(curr);
       const obj = this.objects.get(curr);
@@ -472,8 +480,9 @@ export class GitRepoStore {
 
     const visited2 = new Set<string>();
     const queue2 = [oid2];
-    while (queue2.length > 0) {
-      const curr = queue2.shift()!;
+    let head2 = 0;
+    while (head2 < queue2.length) {
+      const curr = queue2[head2++];
       if (ancestors1.has(curr)) return curr;
       if (visited2.has(curr)) continue;
       visited2.add(curr);
