@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
-import { GitRepoStore, parseCommit } from './gitstore.ts';
+import { GitRepoStore, parseCommit, sha1Object } from './gitstore.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -208,6 +208,7 @@ function getRepoKey(owner: string, name: string): string {
 
 export function createApp(): Server {
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    try {
     const path = pathOf(req);
     const method = req.method ?? 'GET';
     const authHeader = req.headers['authorization'];
@@ -778,34 +779,261 @@ export function createApp(): Server {
 
         if (sub === 'branches' && method === 'GET') {
           const branches: any[] = [];
-          for (const [refName, oid] of repo.refs.entries()) {
-            if (refName.startsWith('refs/heads/')) {
+          for (const [refName, oid] of repo.store.refs.entries()) {
+            if (refName.startsWith('refs/heads/') && oid !== '0000000000000000000000000000000000000000') {
               const name = refName.replace('refs/heads/', '');
               branches.push({ name, commit: { sha: oid } });
             }
-          }
-          if (branches.length === 0) {
-            branches.push({ name: repo.defaultBranch, commit: { sha: '0000000000000000000000000000000000000000' } });
           }
           sendJson(res, 200, branches);
           return;
         }
 
         if (sub === 'commits' && method === 'GET') {
+          const branchParam = searchParamsOf(req).get('sha') || repo.defaultBranch;
+          const tip = repo.store.refs.get('refs/heads/' + branchParam) || '';
           const commits: any[] = [];
-          for (const [oid, content] of repo.gitObjects.entries()) {
-            if (content.toString().startsWith('commit ')) {
-              commits.push({
-                sha: oid,
-                commit: {
-                  message: 'Commit message',
-                  author: { name: VIEWER_LOGIN, email: `${VIEWER_LOGIN}@example.invalid`, date: repo.createdAt }
-                }
-              });
-            }
+          const seen = new Set<string>();
+          const queue: string[] = tip && tip !== '0000000000000000000000000000000000000000' ? [tip] : [];
+          while (queue.length > 0) {
+            const oid = queue.shift()!;
+            if (seen.has(oid)) continue;
+            seen.add(oid);
+            const obj = repo.store.objects.get(oid);
+            if (!obj || obj.type !== 'commit') continue;
+            const parsed = parseCommit(obj.data);
+            const epochMatch = parsed.author.match(/ (\d+) \+0000$/);
+            const epoch = epochMatch ? parseInt(epochMatch[1], 10) : 1735689600;
+            const date = new Date(epoch * 1000).toISOString();
+            commits.push({ sha: oid, commit: { message: parsed.message.trim(), author: { name: VIEWER_LOGIN, email: `${VIEWER_LOGIN}@example.invalid`, date }, committer: { name: VIEWER_LOGIN, email: `${VIEWER_LOGIN}@example.invalid`, date } }, parents: parsed.parents.map((p: string) => ({ sha: p })) });
+            for (const p of parsed.parents) queue.push(p);
           }
           sendJson(res, 200, commits);
           return;
+        }
+
+        if (sub === 'git' && urlParts[6] === 'refs' && method === 'POST') {
+          const bodyBuf = await readBody(req);
+          let body: any = {};
+          try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+          const ref = body.ref;
+          const sha = body.sha;
+          if (!ref || !sha) {
+            sendJson(res, 422, { message: 'Ref and sha required' });
+            return;
+          }
+          const commitObj = repo.store.objects.get(sha);
+          if (!commitObj || commitObj.type !== 'commit') {
+            sendJson(res, 422, { message: 'Commit sha not found' });
+            return;
+          }
+          repo.store.refs.set(ref, sha);
+          if (ref.startsWith('refs/heads/')) {
+            const branchName = ref.replace('refs/heads/', '');
+            const files = repo.store.commitFileMap(sha);
+            repo.store.branchFiles.set(branchName, new Map(files));
+          }
+          sendJson(res, 201, {
+            ref,
+            object: { sha, type: 'commit', url: `http://localhost/repos/${owner}/${repo.name}/git/commits/${sha}` }
+          });
+          return;
+        }
+
+        if (sub === 'contents') {
+          const filePath = urlParts.slice(6).join('/');
+          const params = searchParamsOf(req);
+          const branchParam = params.get('ref') || repo.defaultBranch;
+          const branchRef = 'refs/heads/' + branchParam;
+          const tip = repo.store.refs.get(branchRef) || '0000000000000000000000000000000000000000';
+          const fileMap = tip === '0000000000000000000000000000000000000000' ? new Map<string, Buffer>() : repo.store.commitFileMap(tip);
+
+          if (method === 'GET') {
+            if (!filePath || filePath === '') {
+              // Root directory listing
+              const entries: any[] = [];
+              const seenDirs = new Set<string>();
+              for (const [path, buf] of fileMap.entries()) {
+                const parts = path.split('/');
+                if (parts.length === 1) {
+                  const sha = sha1Object('blob', buf);
+                  entries.push({ name: parts[0], path: parts[0], sha, size: buf.length, type: 'file' });
+                } else {
+                  const dirName = parts[0];
+                  if (!seenDirs.has(dirName)) {
+                    seenDirs.add(dirName);
+                    entries.push({ name: dirName, path: dirName, sha: '0000000000000000000000000000000000000000', size: 0, type: 'dir' });
+                  }
+                }
+              }
+              sendJson(res, 200, entries);
+              return;
+            }
+
+            const existing = fileMap.get(filePath);
+            if (existing !== undefined) {
+              const sha = sha1Object('blob', existing);
+              const name = filePath.split('/').pop() || filePath;
+              sendJson(res, 200, {
+                name,
+                path: filePath,
+                sha,
+                size: existing.length,
+                type: 'file',
+                encoding: 'base64',
+                content: existing.toString('base64')
+              });
+              return;
+            }
+
+            // Check if directory
+            const prefix = filePath + '/';
+            const dirEntries: any[] = [];
+            const seenSub = new Set<string>();
+            for (const [path, buf] of fileMap.entries()) {
+              if (path.startsWith(prefix)) {
+                const rel = path.slice(prefix.length);
+                const subParts = rel.split('/');
+                const subName = subParts[0];
+                if (!seenSub.has(subName)) {
+                  seenSub.add(subName);
+                  if (subParts.length === 1) {
+                    const fullPath = filePath + '/' + subName;
+                    const subBuf = fileMap.get(fullPath)!;
+                    dirEntries.push({ name: subName, path: fullPath, sha: sha1Object('blob', subBuf), size: subBuf.length, type: 'file' });
+                  } else {
+                    dirEntries.push({ name: subName, path: prefix + subName, sha: '0000000000000000000000000000000000000000', size: 0, type: 'dir' });
+                  }
+                }
+              }
+            }
+            if (dirEntries.length > 0) {
+              sendJson(res, 200, dirEntries);
+              return;
+            }
+
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+
+          if (method === 'PUT') {
+            const bodyBuf = await readBody(req);
+            let body: any = {};
+            try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+
+            const message = body.message || 'Update ' + filePath;
+            const contentBase64 = body.content;
+            if (typeof contentBase64 !== 'string') {
+              sendJson(res, 400, { message: 'Invalid base64 content' });
+              return;
+            }
+            let contentBuf: Buffer;
+            try {
+              contentBuf = Buffer.from(contentBase64.replace(/\s/g, ''), 'base64');
+            } catch {
+              sendJson(res, 400, { message: 'Invalid base64' });
+              return;
+            }
+
+            const targetBranch = body.branch || branchParam;
+            const targetBranchRef = 'refs/heads/' + targetBranch;
+            const targetTip = repo.store.refs.get(targetBranchRef) || '0000000000000000000000000000000000000000';
+            const targetFileMap = targetTip === '0000000000000000000000000000000000000000' ? new Map<string, Buffer>() : repo.store.commitFileMap(targetTip);
+
+            const existing = targetFileMap.get(filePath);
+            const existingSha = existing ? sha1Object('blob', existing) : undefined;
+
+            if (existingSha) {
+              if (!body.sha || body.sha !== existingSha) {
+                sendJson(res, 409, { message: 'SHA mismatch or missing for existing file' });
+                return;
+              }
+            } else {
+              if (body.sha && body.sha !== '') {
+                sendJson(res, 409, { message: 'SHA provided for non-existent file' });
+                return;
+              }
+            }
+
+            targetFileMap.set(filePath, contentBuf);
+            const blobOid = repo.store.writeBlob(contentBuf);
+            const treeOid = repo.store.writeTreeFromMap(targetFileMap);
+            const parents = targetTip !== '0000000000000000000000000000000000000000' ? [targetTip] : [];
+            const commitOid = repo.store.writeCommit(treeOid, parents, message);
+
+            repo.store.refs.set(targetBranchRef, commitOid);
+            repo.store.commitFiles.set(commitOid, new Map(targetFileMap));
+            repo.store.branchFiles.set(targetBranch, new Map(targetFileMap));
+            repo.store.packCache.delete(targetTip);
+
+            // If default branch ref wasn't set or main, ensure refs/heads/main exists
+            if (!repo.store.refs.has('refs/heads/' + repo.defaultBranch)) {
+              repo.store.refs.set('refs/heads/' + repo.defaultBranch, commitOid);
+            }
+
+            const status = existingSha ? 200 : 201;
+            const name = filePath.split('/').pop() || filePath;
+            sendJson(res, status, {
+              content: {
+                name,
+                path: filePath,
+                sha: blobOid,
+                size: contentBuf.length,
+                type: 'file',
+                encoding: 'base64',
+                content: contentBuf.toString('base64')
+              },
+              commit: {
+                sha: commitOid,
+                message
+              }
+            });
+            return;
+          }
+
+          if (method === 'DELETE') {
+            const bodyBuf = await readBody(req);
+            let body: any = {};
+            try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+
+            const message = body.message || 'Delete ' + filePath;
+            const targetBranch = body.branch || branchParam;
+            const targetBranchRef = 'refs/heads/' + targetBranch;
+            const targetTip = repo.store.refs.get(targetBranchRef) || '0000000000000000000000000000000000000000';
+            if (targetTip === '0000000000000000000000000000000000000000') {
+              sendJson(res, 404, { message: 'Not Found' });
+              return;
+            }
+
+            const targetFileMap = repo.store.commitFileMap(targetTip);
+            const existing = targetFileMap.get(filePath);
+            if (!existing) {
+              sendJson(res, 404, { message: 'Not Found' });
+              return;
+            }
+            const existingSha = sha1Object('blob', existing);
+            if (!body.sha || body.sha !== existingSha) {
+              sendJson(res, 409, { message: 'SHA mismatch' });
+              return;
+            }
+
+            targetFileMap.delete(filePath);
+            const treeOid = repo.store.writeTreeFromMap(targetFileMap);
+            const commitOid = repo.store.writeCommit(treeOid, [targetTip], message);
+
+            repo.store.refs.set(targetBranchRef, commitOid);
+            repo.store.commitFiles.set(commitOid, new Map(targetFileMap));
+            repo.store.branchFiles.set(targetBranch, new Map(targetFileMap));
+            repo.store.packCache.delete(targetTip);
+
+            sendJson(res, 200, {
+              commit: {
+                sha: commitOid,
+                message
+              }
+            });
+            return;
+          }
         }
 
         if (sub === 'labels') {
@@ -1041,9 +1269,8 @@ export function createApp(): Server {
             }
 
             if (actionSub === 'files' && method === 'GET') {
-              const branchFilesMap = repo.branchFiles || new Map();
-              const baseFiles = branchFilesMap.get(pull.base.ref) || new Map<string, string>();
-              const headFiles = branchFilesMap.get(pull.head.ref) || new Map<string, string>();
+              const baseFiles = repo.store.commitFileMap(pull.base.sha);
+              const headFiles = repo.store.commitFileMap(pull.head.sha);
 
               const files: any[] = [];
               const allPaths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
@@ -1054,7 +1281,7 @@ export function createApp(): Server {
                   files.push({ filename: path, status: 'added', additions: 1, deletions: 0, changes: 1 });
                 } else if (baseContent !== undefined && headContent === undefined) {
                   files.push({ filename: path, status: 'removed', additions: 0, deletions: 1, changes: 1 });
-                } else if (baseContent !== headContent) {
+                } else if (baseContent !== undefined && headContent !== undefined && !baseContent.equals(headContent)) {
                   files.push({ filename: path, status: 'modified', additions: 1, deletions: 1, changes: 2 });
                 }
               }
@@ -1096,5 +1323,10 @@ export function createApp(): Server {
     }
 
     sendJson(res, 404, { message: 'Not Found' });
+    } catch (err) {
+      console.error('handler error:', err);
+      if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
+      else { try { res.end(); } catch {} }
+    }
   });
 }

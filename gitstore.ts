@@ -425,16 +425,29 @@ export class GitRepoStore {
     return this.writeObject('commit', data);
   }
 
-  commitFileMap(branch: string, fileMap: Map<string, Buffer>, message: string): string {
-    const treeOid = this.writeTreeFromMap(fileMap);
-    const parent = this.refs.get(branch);
-    const parents = parent ? [parent] : [];
-    const commitOid = this.writeCommit(treeOid, parents, message);
-    this.refs.set(branch, commitOid);
-    this.branchFiles.set(branch, new Map(fileMap));
-    this.commitFiles.set(commitOid, new Map(fileMap));
-    this.packCache.delete(branch);
-    return commitOid;
+  commitFileMap(commitOid: string): Map<string, Buffer> {
+    const cached = this.commitFiles.get(commitOid);
+    if (cached) return new Map(cached);
+    const out = new Map<string, Buffer>();
+    const commitObj = this.objects.get(commitOid);
+    if (!commitObj || commitObj.type !== 'commit') return out;
+    const parsed = parseCommit(commitObj.data);
+    const walk = (treeOid: string, prefix: string): void => {
+      const treeObj = this.objects.get(treeOid);
+      if (!treeObj || treeObj.type !== 'tree') return;
+      for (const entry of parseTree(treeObj.data)) {
+        const fullPath = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.mode === '40000') {
+          walk(entry.oid, fullPath);
+        } else {
+          const blob = this.objects.get(entry.oid);
+          if (blob && blob.type === 'blob') out.set(fullPath, Buffer.from(blob.data));
+        }
+      }
+    };
+    walk(parsed.tree, '');
+    this.commitFiles.set(commitOid, new Map(out));
+    return out;
   }
 
   isAncestor(commitOid: string, ancestorOid: string): boolean {
