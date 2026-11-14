@@ -782,7 +782,9 @@ export function createApp(): Server {
         const packBytes = packEncode(encodeMap);
 
         const responseChunks: Buffer[] = [];
-        // Acknowledgments section
+        if (isFetchCommand) {
+          responseChunks.push(Buffer.from(pktLine('acknowledgments\n')));
+        }
         if (haves.length > 0) {
           let acked = false;
           for (const h of haves) {
@@ -799,9 +801,23 @@ export function createApp(): Server {
         }
 
         if (isFetchCommand) {
-          responseChunks.push(Buffer.from('0001')); // delim for v2 fetch sections
-          // wanted-refs section (optional but nice)
-          // packfile section in sideband band 1
+          responseChunks.push(Buffer.from('0001')); // delim: end of acknowledgments
+          if (deepenDepth > 0) {
+            responseChunks.push(Buffer.from(pktLine('shallow-info\n')));
+            for (const w of wants) {
+              const obj = repo.store.objects.get(w);
+              if (obj && obj.type === 'commit') responseChunks.push(Buffer.from(pktLine(`shallow ${w}\n`)));
+            }
+            responseChunks.push(Buffer.from('0001')); // delim: end of shallow-info
+          }
+          responseChunks.push(Buffer.from(pktLine('wanted-refs\n')));
+          for (const w of wants) {
+            for (const [refName, oid] of repo.store.refs.entries()) {
+              if (oid === w) responseChunks.push(Buffer.from(pktLine(`${w} ${refName}\n`)));
+            }
+          }
+          responseChunks.push(Buffer.from('0001')); // delim: end of wanted-refs
+          responseChunks.push(Buffer.from(pktLine('packfile\n')));
         }
 
         // Sideband band 1 packing
