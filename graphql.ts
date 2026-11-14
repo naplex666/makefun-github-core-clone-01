@@ -945,6 +945,21 @@ Object.assign(FIELD_RESOLVERS, {
       return types;
     }
   },
+  CreateIssuePayload: {
+    issue: (obj: any) => obj.issue
+  },
+  CloseIssuePayload: {
+    issue: (obj: any) => obj.issue
+  },
+  CreatePullRequestPayload: {
+    pullRequest: (obj: any) => obj.pullRequest
+  },
+  MergePullRequestPayload: {
+    pullRequest: (obj: any) => obj.pullRequest
+  },
+  AddCommentPayload: {
+    commentEdge: (obj: any) => obj.commentEdge
+  },
   Query: {
     viewer: (_obj: any, _args: any, ctx: GqlCtx) => ({ __typename: 'User', login: ctx.viewerLogin, id: 'U_1', name: 'Ada Iversen' }),
     repository: (obj: any, args: any, ctx: GqlCtx) => {
@@ -982,24 +997,73 @@ Object.assign(FIELD_RESOLVERS, {
   },
   Mutation: {
     createIssue: (obj: any, args: any, ctx: GqlCtx, errors: any[]) => {
-      errors.push({ message: 'mutation not implemented yet' });
-      return null;
+      const input = args.input || {};
+      const repo = findRepoByGlobalId(ctx, input.repositoryId);
+      if (!repo) { errors.push({ message: 'repository not found' }); return null; }
+      const repoKey = repoKeyOf(ctx, repo);
+      const repoIssues = ctx.issuesMap.get(repoKey) || [];
+      const now = ctx.nowIso();
+      const newIssue: any = { id: ctx.nextIssueId(), number: repoIssues.length + 1, title: input.title || '', body: input.body || '', state: 'open', user: ctx.viewerLogin, labels: [], createdAt: now, updatedAt: now, comments: [] };
+      repoIssues.push(newIssue);
+      ctx.issuesMap.set(repoKey, repoIssues);
+      return { __typename: 'CreateIssuePayload', issue: { __typename: 'Issue', ...newIssue } };
     },
     closeIssue: (obj: any, args: any, ctx: GqlCtx, errors: any[]) => {
-      errors.push({ message: 'mutation not implemented yet' });
-      return null;
+      const input = args.input || {};
+      const issue = findIssueByGlobalId(ctx, input.issueId);
+      if (!issue) { errors.push({ message: 'issue not found' }); return null; }
+      issue.state = 'closed';
+      issue.updatedAt = ctx.nowIso();
+      return { __typename: 'CloseIssuePayload', issue: { __typename: 'Issue', ...issue } };
     },
     createPullRequest: (obj: any, args: any, ctx: GqlCtx, errors: any[]) => {
-      errors.push({ message: 'mutation not implemented yet' });
-      return null;
+      const input = args.input || {};
+      const repo = findRepoByGlobalId(ctx, input.repositoryId);
+      if (!repo) { errors.push({ message: 'repository not found' }); return null; }
+      const repoKey = repoKeyOf(ctx, repo);
+      const repoPulls = ctx.pullsMap.get(repoKey) || [];
+      const headRefName = input.headRefName || repo.defaultBranch;
+      const baseRefName = input.baseRefName || repo.defaultBranch;
+      const zeroOid = '0000000000000000000000000000000000000000';
+      const headSha = repo.store.refs.get('refs/heads/' + headRefName) || zeroOid;
+      const baseSha = repo.store.refs.get('refs/heads/' + baseRefName) || zeroOid;
+      const now = ctx.nowIso();
+      const newPull: any = { id: ctx.nextPullId(), number: repoPulls.length + 1, title: input.title || '', body: input.body || '', state: 'open', head: { ref: headRefName, sha: headSha }, base: { ref: baseRefName, sha: baseSha }, user: ctx.viewerLogin, merged: false, merged_at: null, merge_commit_sha: null, createdAt: now, updatedAt: now };
+      repoPulls.push(newPull);
+      ctx.pullsMap.set(repoKey, repoPulls);
+      return { __typename: 'CreatePullRequestPayload', pullRequest: { __typename: 'PullRequest', ...newPull } };
     },
     mergePullRequest: (obj: any, args: any, ctx: GqlCtx, errors: any[]) => {
-      errors.push({ message: 'mutation not implemented yet' });
-      return null;
+      const input = args.input || {};
+      const pull = findPullByGlobalId(ctx, input.pullRequestId);
+      if (!pull) { errors.push({ message: 'pull request not found' }); return null; }
+      if (pull.merged || pull.state === 'closed') { errors.push({ message: 'pull request already merged or closed' }); return null; }
+      const repo = findRepoForPull(ctx, pull);
+      if (!repo) { errors.push({ message: 'repository not found' }); return null; }
+      if (computeMergeable(pull, ctx) === 'CONFLICTING') { errors.push({ message: 'Merge conflict' }); return null; }
+      const zeroOid = '0000000000000000000000000000000000000000';
+      const baseTip = repo.store.refs.get('refs/heads/' + pull.base.ref) || zeroOid;
+      const headFiles = repo.store.commitFileMap(pull.head.sha);
+      const mergeTree = repo.store.writeTreeFromMap(headFiles);
+      const commitSha = repo.store.writeCommit(mergeTree, baseTip === zeroOid ? [] : [baseTip], `Squash merge PR #${pull.number}: ${pull.title}`);
+      repo.store.commitFiles.set(commitSha, new Map(headFiles));
+      repo.store.branchFiles.set(pull.base.ref, new Map<string, Buffer>(headFiles));
+      pull.state = 'closed';
+      pull.merged = true;
+      const mergedAtTime = ctx.nowIso();
+      pull.merged_at = mergedAtTime;
+      pull.merge_commit_sha = commitSha;
+      pull.updatedAt = mergedAtTime;
+      repo.store.refs.set('refs/heads/' + pull.base.ref, commitSha);
+      return { __typename: 'MergePullRequestPayload', pullRequest: { __typename: 'PullRequest', ...pull } };
     },
     addComment: (obj: any, args: any, ctx: GqlCtx, errors: any[]) => {
-      errors.push({ message: 'mutation not implemented yet' });
-      return null;
+      const input = args.input || {};
+      const issue = findIssueByGlobalId(ctx, input.subjectId);
+      if (!issue) { errors.push({ message: 'subject not found' }); return null; }
+      const comment: any = { id: ctx.nextCommentId(), body: input.body || '', user: ctx.viewerLogin, createdAt: ctx.nowIso() };
+      issue.comments.push(comment);
+      return { __typename: 'AddCommentPayload', commentEdge: { __typename: 'CommentEdge', node: { __typename: 'IssueComment', ...comment }, cursor: null } };
     }
   }
 });
