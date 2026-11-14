@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
-import { GitRepoStore, parseCommit, sha1Object, parseTree, packEncode } from './gitstore.ts';
+import { GitRepoStore, parseCommit, sha1Object, parseTree, packEncode, packDecode } from './gitstore.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -226,6 +226,11 @@ export function createApp(): Server {
 
     if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
       sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+      return;
+    }
+
+    if (method === 'GET' && path === '/api/v3/meta') {
+      sendJson(res, 200, { installed_version: '1.0.0' });
       return;
     }
 
@@ -523,13 +528,14 @@ export function createApp(): Server {
 
       if (action === 'info/refs') {
         const service = searchParamsOf(req).get('service');
-        if (service === 'git-upload-pack' || service === 'git-receive-pack') {
+        const protocolHeader = req.headers['git-protocol'] as string;
+        if (service === 'git-receive-pack' || ((service === 'git-upload-pack') && !protocolHeader?.includes('version=2'))) {
           const pktLine = (str: string) => (str.length + 4).toString(16).padStart(4, '0') + str;
           const header = pktLine(`# service=${service}\n`);
           let refsPkt = '';
           const zeroOid = '0000000000000000000000000000000000000000';
           const headOid = repo.store.refs.get('refs/heads/' + repo.defaultBranch) || repo.store.refs.get('HEAD') || zeroOid;
-          const caps = 'multi_ack side-band-64k ofs-delta agent=git/forge';
+          const caps = 'multi_ack multi_ack_detailed side-band-64k ofs-delta report-status delete-refs agent=git/forge';
           const refsEntries = Array.from(repo.store.refs.entries());
 
           if (refsEntries.length === 0) {
@@ -841,17 +847,45 @@ export function createApp(): Server {
           }
         }
 
+        // Store the pack that follows the command-list flush packet (if any).
+        try {
+          const packBytes = reqBuf.subarray(offset);
+          if (packBytes.length >= 12 && packBytes.subarray(0, 4).toString('ascii') === 'PACK') {
+            const decoded = packDecode(packBytes, repo.store.objects);
+            for (const [oid, obj] of decoded) repo.store.objects.set(oid, obj);
+          }
+        } catch {}
+
         const reportLines: string[] = ['unpack ok\n'];
         for (const cmd of commands) {
-          const currentOid = repo.refs.get(cmd.refName) || '0000000000000000000000000000000000000000';
-          if (cmd.newOid === '0000000000000000000000000000000000000000') {
-            repo.refs.delete(cmd.refName);
-            reportLines.push(`ok ${cmd.refName}\n`);
-          } else if (currentOid === cmd.oldOid || currentOid === '0000000000000000000000000000000000000000') {
-            repo.refs.set(cmd.refName, cmd.newOid);
-            reportLines.push(`ok ${cmd.refName}\n`);
-          } else {
+          const zeroOid = '0000000000000000000000000000000000000000';
+          const currentOid = repo.store.refs.get(cmd.refName) || zeroOid;
+          const isDelete = cmd.newOid === zeroOid;
+          const isCreate = cmd.oldOid === zeroOid;
+          if (isDelete) {
+            if (currentOid === zeroOid || currentOid !== cmd.oldOid) {
+              reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
+            } else {
+              repo.store.refs.delete(cmd.refName);
+              if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.delete(cmd.refName.replace('refs/heads/', ''));
+              reportLines.push(`ok ${cmd.refName}\n`);
+            }
+          } else if (isCreate) {
+            if (currentOid !== zeroOid) {
+              reportLines.push(`ng ${cmd.refName} already exists\n`);
+            } else {
+              repo.store.refs.set(cmd.refName, cmd.newOid);
+              if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.set(cmd.refName.replace('refs/heads/', ''), repo.store.commitFileMap(cmd.newOid));
+              reportLines.push(`ok ${cmd.refName}\n`);
+            }
+          } else if (currentOid !== cmd.oldOid) {
             reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
+          } else if (!repo.store.isAncestor(cmd.newOid, cmd.oldOid)) {
+            reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
+          } else {
+            repo.store.refs.set(cmd.refName, cmd.newOid);
+            if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.set(cmd.refName.replace('refs/heads/', ''), repo.store.commitFileMap(cmd.newOid));
+            reportLines.push(`ok ${cmd.refName}\n`);
           }
         }
 
