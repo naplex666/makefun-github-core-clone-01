@@ -135,6 +135,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 interface Repo {
+  id: number;
   owner: string;
   name: string;
   private: boolean;
@@ -145,6 +146,8 @@ interface Repo {
   gitObjects: Map<string, Buffer>;
   refs: Map<string, string>;
   packCache: Map<string, Buffer>;
+  branchFiles?: Map<string, Map<string, string>>;
+  commitFiles?: Map<string, Map<string, string>>;
 }
 
 interface Issue {
@@ -173,15 +176,14 @@ interface Pull {
   title: string;
   body: string;
   state: 'open' | 'closed';
-  head: string;
-  base: string;
+  head: { ref: string; sha: string };
+  base: { ref: string; sha: string };
   user: string;
   merged: boolean;
-  mergedAt: string | null;
-  mergeCommitSha: string | null;
+  merged_at: string | null;
+  merge_commit_sha: string | null;
   createdAt: string;
   updatedAt: string;
-  files?: { filename: string; status: string }[];
 }
 
 const repos = new Map<string, Repo>();
@@ -189,9 +191,19 @@ const issuesMap = new Map<string, Issue[]>();
 const pullsMap = new Map<string, Pull[]>();
 const labelsMap = new Map<string, Set<string>>();
 
+let repoIdCounter = 5000;
 let issueIdCounter = 1;
 let commentIdCounter = 1;
 let pullIdCounter = 1;
+
+const MCP_TOOLS_FROZEN = Object.freeze([
+  Object.freeze({ name: 'create_repo', description: 'Create a repository', inputSchema: Object.freeze({ type: 'object', properties: Object.freeze({ name: Object.freeze({ type: 'string' }), owner: Object.freeze({ type: 'string' }) }), required: Object.freeze(['name']) }) }),
+  Object.freeze({ name: 'get_repo', description: 'Get a repository', inputSchema: Object.freeze({ type: 'object', properties: Object.freeze({ owner: Object.freeze({ type: 'string' }), repo: Object.freeze({ type: 'string' }), repository: Object.freeze({ type: 'string' }) }), required: Object.freeze([]) }) }),
+  Object.freeze({ name: 'create_issue', description: 'Create an issue', inputSchema: Object.freeze({ type: 'object', properties: Object.freeze({ owner: Object.freeze({ type: 'string' }), repo: Object.freeze({ type: 'string' }), repository: Object.freeze({ type: 'string' }), title: Object.freeze({ type: 'string' }), body: Object.freeze({ type: 'string' }) }), required: Object.freeze(['title']) }) }),
+  Object.freeze({ name: 'list_issues', description: 'List issues', inputSchema: Object.freeze({ type: 'object', properties: Object.freeze({ owner: Object.freeze({ type: 'string' }), repo: Object.freeze({ type: 'string' }), repository: Object.freeze({ type: 'string' }), state: Object.freeze({ type: 'string' }) }), required: Object.freeze([]) }) }),
+  Object.freeze({ name: 'create_pull_request', description: 'Create a PR', inputSchema: Object.freeze({ type: 'object', properties: Object.freeze({ owner: Object.freeze({ type: 'string' }), repo: Object.freeze({ type: 'string' }), repository: Object.freeze({ type: 'string' }), title: Object.freeze({ type: 'string' }), head: Object.freeze({ type: 'string' }), base: Object.freeze({ type: 'string' }) }), required: Object.freeze(['title', 'head', 'base']) }) }),
+  Object.freeze({ name: 'merge_pull_request', description: 'Merge a PR', inputSchema: Object.freeze({ type: 'object', properties: Object.freeze({ owner: Object.freeze({ type: 'string' }), repo: Object.freeze({ type: 'string' }), repository: Object.freeze({ type: 'string' }), pull_number: Object.freeze({ type: 'number' }), number: Object.freeze({ type: 'number' }) }), required: Object.freeze([]) }) })
+]);
 
 function getRepoKey(owner: string, name: string): string {
   return `${owner.toLowerCase()}/${name.toLowerCase()}`;
@@ -249,7 +261,7 @@ export function createApp(): Server {
         const errors: any[] = [];
 
         if (queryStr.includes('viewer')) {
-          data.viewer = { login: 'octocat', id: 'U_1' };
+          data.viewer = { login: VIEWER_LOGIN, id: 'U_1' };
         }
         if (queryStr.includes('repository(')) {
           const ownerMatch = queryStr.match(/owner:\s*"([^"]+)"/);
@@ -321,41 +333,173 @@ export function createApp(): Server {
         return;
       }
       if (methodRpc === 'notifications/initialized') {
-        res.writeHead(200, { 'content-type': JSON_TYPE, 'x-github-request-id': crypto.randomUUID() });
+        res.writeHead(200, { 'content-type': JSON_TYPE, 'x-github-request-id': nextReqId() });
         res.end();
         return;
       }
       if (methodRpc === 'tools/list') {
-        const tools = [
-          { name: 'create_repo', description: 'Create a repository', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
-          { name: 'get_repo', description: 'Get a repository', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, name: { type: 'string' } }, required: ['owner', 'name'] } },
-          { name: 'create_issue', description: 'Create an issue', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' } }, required: ['owner', 'repo', 'title'] } },
-          { name: 'list_issues', description: 'List issues', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' } }, required: ['owner', 'repo'] } },
-          { name: 'create_pull_request', description: 'Create a PR', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, head: { type: 'string' }, base: { type: 'string' } }, required: ['owner', 'repo', 'title', 'head', 'base'] } },
-          { name: 'merge_pull_request', description: 'Merge a PR', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, pull_number: { type: 'number' } }, required: ['owner', 'repo', 'pull_number'] } }
-        ];
-        sendJson(res, 200, { jsonrpc: '2.0', result: { tools }, id });
+        sendJson(res, 200, { jsonrpc: '2.0', result: { tools: MCP_TOOLS_FROZEN }, id });
         return;
       }
       if (methodRpc === 'tools/call') {
-        const toolName = params.name;
+        const rawToolName = params.name || '';
+        const toolName = rawToolName.includes('__') ? rawToolName.split('__').pop() : rawToolName;
         const args = params.arguments || {};
-        
-        if (toolName?.endsWith('create_repo') || toolName === 'create_repo') {
+        const lowerToolName = toolName.toLowerCase();
+
+        const owner = args.owner || VIEWER_LOGIN;
+        const repoName = args.repo || args.repository;
+
+        if (lowerToolName === 'create_repo') {
           const name = args.name;
-          const owner = args.owner || 'octocat';
+          if (!name) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Missing repository name' }], isError: true }, id });
+            return;
+          }
           const repoKey = getRepoKey(owner, name);
-          const now = new Date().toISOString();
+          const now = nowIso();
+          const repoId = repoIdCounter++;
           const repo: Repo = {
+            id: repoId,
             owner, name, private: false, defaultBranch: 'main', createdAt: now, updatedAt: now, description: null,
-            gitObjects: new Map(), refs: new Map(), packCache: new Map()
+            gitObjects: new Map(), refs: new Map(), packCache: new Map(), branchFiles: new Map(), commitFiles: new Map()
           };
           repos.set(repoKey, repo);
           sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify(repo) }] }, id });
           return;
         }
 
-        sendJson(res, 200, { jsonrpc: '2.0', error: { code: -32601, message: `Unknown tool: ${toolName}` }, id });
+        if (lowerToolName === 'get_repo') {
+          if (!repoName) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Missing repository name' }], isError: true }, id });
+            return;
+          }
+          const repoKey = getRepoKey(owner, repoName);
+          const repo = repos.get(repoKey);
+          if (!repo) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Repository not found' }], isError: true }, id });
+            return;
+          }
+          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify(repo) }] }, id });
+          return;
+        }
+
+        if (lowerToolName === 'create_issue') {
+          if (!repoName || !args.title) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Missing repository or title' }], isError: true }, id });
+            return;
+          }
+          const repoKey = getRepoKey(owner, repoName);
+          const repo = repos.get(repoKey);
+          if (!repo) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Repository not found' }], isError: true }, id });
+            return;
+          }
+          const repoIssues = issuesMap.get(repoKey) || [];
+          const now = nowIso();
+          const newIssue: Issue = {
+            id: issueIdCounter++,
+            number: repoIssues.length + 1,
+            title: args.title,
+            body: args.body || '',
+            state: 'open',
+            user: VIEWER_LOGIN,
+            labels: [],
+            createdAt: now,
+            updatedAt: now,
+            comments: []
+          };
+          repoIssues.push(newIssue);
+          issuesMap.set(repoKey, repoIssues);
+          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify(newIssue) }] }, id });
+          return;
+        }
+
+        if (lowerToolName === 'list_issues') {
+          if (!repoName) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Missing repository' }], isError: true }, id });
+            return;
+          }
+          const repoKey = getRepoKey(owner, repoName);
+          const repoIssues = issuesMap.get(repoKey) || [];
+          const state = args.state || 'open';
+          const filtered = repoIssues.filter(i => state === 'all' || i.state === state);
+          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify(filtered) }] }, id });
+          return;
+        }
+
+        if (lowerToolName === 'create_pull_request') {
+          if (!repoName || !args.title || !args.head || !args.base) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Missing required arguments for PR' }], isError: true }, id });
+            return;
+          }
+          const repoKey = getRepoKey(owner, repoName);
+          const repo = repos.get(repoKey);
+          if (!repo) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Repository not found' }], isError: true }, id });
+            return;
+          }
+          const repoPulls = pullsMap.get(repoKey) || [];
+          const headSha = repo.refs.get('refs/heads/' + args.head) || '0000000000000000000000000000000000000000';
+          const baseSha = repo.refs.get('refs/heads/' + args.base) || '0000000000000000000000000000000000000000';
+          const now = nowIso();
+          const newPull: Pull = {
+            id: pullIdCounter++,
+            number: repoPulls.length + 1,
+            title: args.title,
+            body: args.body || '',
+            state: 'open',
+            head: { ref: args.head, sha: headSha },
+            base: { ref: args.base, sha: baseSha },
+            user: VIEWER_LOGIN,
+            merged: false,
+            merged_at: null,
+            merge_commit_sha: null,
+            createdAt: now,
+            updatedAt: now
+          };
+          repoPulls.push(newPull);
+          pullsMap.set(repoKey, repoPulls);
+          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify(newPull) }] }, id });
+          return;
+        }
+
+        if (lowerToolName === 'merge_pull_request') {
+          const prNum = args.pull_number ?? args.number;
+          if (!repoName || prNum === undefined) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Missing repository or pull_number' }], isError: true }, id });
+            return;
+          }
+          const repoKey = getRepoKey(owner, repoName);
+          const repo = repos.get(repoKey);
+          if (!repo) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Repository not found' }], isError: true }, id });
+            return;
+          }
+          const repoPulls = pullsMap.get(repoKey) || [];
+          const pull = repoPulls.find(p => p.number === Number(prNum));
+          if (!pull) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Pull request not found' }], isError: true }, id });
+            return;
+          }
+          if (pull.merged || pull.state === 'closed') {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Already merged or closed' }], isError: true }, id });
+            return;
+          }
+          const commitSha = crypto.createHash('sha1').update(`squash-mcp-${pull.id}-${nowIso()}`).digest('hex');
+          pull.state = 'closed';
+          pull.merged = true;
+          const mergedAtTime = nowIso();
+          pull.merged_at = mergedAtTime;
+          pull.merge_commit_sha = commitSha;
+          pull.updatedAt = mergedAtTime;
+
+          repo.refs.set('refs/heads/' + pull.base.ref, commitSha);
+          sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: JSON.stringify({ sha: commitSha, merged: true, message: `Merged PR #${pull.number}` }) }] }, id });
+          return;
+        }
+
+        sendJson(res, 200, { jsonrpc: '2.0', error: { code: -32601, message: `Unknown tool: ${rawToolName}` }, id });
         return;
       }
 
@@ -390,7 +534,7 @@ export function createApp(): Server {
           res.writeHead(200, {
             'content-type': `application/x-${service}-advertisement`,
             'content-length': Buffer.byteLength(body),
-            'x-github-request-id': crypto.randomUUID()
+            'x-github-request-id': nextReqId()
           });
           res.end(body);
           return;
@@ -402,7 +546,7 @@ export function createApp(): Server {
             res.writeHead(200, {
               'content-type': 'application/x-git-upload-pack-advertisement',
               'content-length': Buffer.byteLength(body),
-              'x-github-request-id': crypto.randomUUID()
+              'x-github-request-id': nextReqId()
             });
             res.end(body);
             return;
@@ -443,7 +587,7 @@ export function createApp(): Server {
         res.writeHead(200, {
           'content-type': 'application/x-git-upload-pack-result',
           'content-length': responseBuf.length,
-          'x-github-request-id': crypto.randomUUID()
+          'x-github-request-id': nextReqId()
         });
         res.end(responseBuf);
         return;
@@ -495,7 +639,7 @@ export function createApp(): Server {
         res.writeHead(200, {
           'content-type': 'application/x-git-receive-pack-result',
           'content-length': Buffer.byteLength(sidebandResp),
-          'x-github-request-id': crypto.randomUUID()
+          'x-github-request-id': nextReqId()
         });
         res.end(sidebandResp);
         return;
@@ -547,14 +691,16 @@ export function createApp(): Server {
         }
 
         const now = nowIso();
+        const repoId = repoIdCounter++;
         const newRepo: Repo = {
+          id: repoId,
           owner, name, private: body.private ?? false, defaultBranch: body.default_branch || 'main',
           createdAt: now, updatedAt: now, description: body.description || null,
-          gitObjects: new Map(), refs: new Map(), packCache: new Map()
+          gitObjects: new Map(), refs: new Map(), packCache: new Map(), branchFiles: new Map(), commitFiles: new Map()
         };
         repos.set(repoKey, newRepo);
         sendJson(res, 201, {
-          id: 5000 + repos.size,
+          id: newRepo.id,
           node_id: 'R_' + newRepo.name,
           name: newRepo.name,
           full_name: `${owner}/${newRepo.name}`,
@@ -587,7 +733,7 @@ export function createApp(): Server {
         const sub = urlParts[5];
         if (!sub && method === 'GET') {
           sendJson(res, 200, {
-            id: 5000,
+            id: repo.id,
             node_id: 'R_' + repo.name,
             name: repo.name,
             full_name: `${repo.owner}/${repo.name}`,
@@ -608,7 +754,7 @@ export function createApp(): Server {
           if (body.private !== undefined) repo.private = body.private;
           repo.updatedAt = nowIso();
           sendJson(res, 200, {
-            id: 5000,
+            id: repo.id,
             node_id: 'R_' + repo.name,
             name: repo.name,
             full_name: `${repo.owner}/${repo.name}`,
@@ -705,7 +851,7 @@ export function createApp(): Server {
               ...i,
               user: { login: i.user, id: 1000 },
               labels: i.labels.map(l => ({ name: l })),
-              comments: i.comments.length
+              comments: i.comments
             }));
             sendJson(res, 200, formatted);
             return;
@@ -815,6 +961,130 @@ export function createApp(): Server {
                 });
                 return;
               }
+            }
+          }
+        }
+
+        if (sub === 'pulls') {
+          const pullNumOrSub = urlParts[6];
+          const actionSub = urlParts[7];
+          const repoPulls = pullsMap.get(repoKey) || [];
+
+          if (!pullNumOrSub && method === 'GET') {
+            const params = searchParamsOf(req);
+            const state = params.get('state') || 'open';
+            let filtered = repoPulls.filter(p => state === 'all' || p.state === state);
+            const formatted = filtered.map(p => ({
+              ...p,
+              user: { login: p.user, id: 1000 }
+            }));
+            sendJson(res, 200, formatted);
+            return;
+          }
+
+          if (!pullNumOrSub && method === 'POST') {
+            const bodyBuf = await readBody(req);
+            let body: any = {};
+            try { body = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch {}
+
+            const title = body.title || '';
+            const bodyText = body.body || '';
+            const headInput = body.head;
+            const baseInput = body.base;
+            const headRefName = typeof headInput === 'string' ? headInput : (headInput?.ref || repo.defaultBranch);
+            const baseRefName = typeof baseInput === 'string' ? baseInput : (baseInput?.ref || repo.defaultBranch);
+
+            const headSha = repo.refs.get('refs/heads/' + headRefName) || '0000000000000000000000000000000000000000';
+            const baseSha = repo.refs.get('refs/heads/' + baseRefName) || '0000000000000000000000000000000000000000';
+
+            const now = nowIso();
+            const newPull: Pull = {
+              id: pullIdCounter++,
+              number: repoPulls.length + 1,
+              title,
+              body: bodyText,
+              state: 'open',
+              head: { ref: headRefName, sha: headSha },
+              base: { ref: baseRefName, sha: baseSha },
+              user: VIEWER_LOGIN,
+              merged: false,
+              merged_at: null,
+              merge_commit_sha: null,
+              createdAt: now,
+              updatedAt: now
+            };
+            repoPulls.push(newPull);
+            pullsMap.set(repoKey, repoPulls);
+            sendJson(res, 201, {
+              ...newPull,
+              user: { login: newPull.user, id: 1000 }
+            });
+            return;
+          }
+
+          if (pullNumOrSub && !isNaN(Number(pullNumOrSub))) {
+            const pullNum = Number(pullNumOrSub);
+            const pull = repoPulls.find(p => p.number === pullNum);
+            if (!pull) {
+              sendJson(res, 404, { message: 'Pull request not found' });
+              return;
+            }
+
+            if (!actionSub && method === 'GET') {
+              sendJson(res, 200, {
+                ...pull,
+                user: { login: pull.user, id: 1000 }
+              });
+              return;
+            }
+
+            if (actionSub === 'files' && method === 'GET') {
+              const branchFilesMap = repo.branchFiles || new Map();
+              const baseFiles = branchFilesMap.get(pull.base.ref) || new Map<string, string>();
+              const headFiles = branchFilesMap.get(pull.head.ref) || new Map<string, string>();
+
+              const files: any[] = [];
+              const allPaths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
+              for (const path of allPaths) {
+                const baseContent = baseFiles.get(path);
+                const headContent = headFiles.get(path);
+                if (baseContent === undefined && headContent !== undefined) {
+                  files.push({ filename: path, status: 'added', additions: 1, deletions: 0, changes: 1 });
+                } else if (baseContent !== undefined && headContent === undefined) {
+                  files.push({ filename: path, status: 'removed', additions: 0, deletions: 1, changes: 1 });
+                } else if (baseContent !== headContent) {
+                  files.push({ filename: path, status: 'modified', additions: 1, deletions: 1, changes: 2 });
+                }
+              }
+              sendJson(res, 200, files);
+              return;
+            }
+
+            if (actionSub === 'merge' && method === 'PUT') {
+              if (pull.state === 'closed' || pull.merged) {
+                sendJson(res, 405, { message: 'Pull Request already merged or closed' });
+                return;
+              }
+
+              const commitSha = crypto.createHash('sha1').update(`squash-${pull.id}-${nowIso()}`).digest('hex');
+              pull.state = 'closed';
+              pull.merged = true;
+              const mergedAtTime = nowIso();
+              pull.merged_at = mergedAtTime;
+              pull.merge_commit_sha = commitSha;
+              pull.updatedAt = mergedAtTime;
+
+              repo.refs.set('refs/heads/' + pull.base.ref, commitSha);
+              if (repo.branchFiles && repo.branchFiles.has(pull.head.ref)) {
+                repo.branchFiles.set(pull.base.ref, new Map(repo.branchFiles.get(pull.head.ref)!));
+              }
+
+              sendJson(res, 200, {
+                sha: commitSha,
+                merged: true,
+                message: `Merged pull request #${pull.number} (${pull.title})`
+              });
+              return;
             }
           }
         }
