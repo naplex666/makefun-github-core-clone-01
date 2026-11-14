@@ -287,7 +287,7 @@ export function createApp(): Server {
       const params = rpc.params || {};
 
       if (methodRpc === 'server/discover') {
-        sendJson(res, 200, { jsonrpc: '2.0', result: { supportedVersions: ['2026-07-28'] }, id });
+        sendJson(res, 200, { jsonrpc: '2.0', result: { supportedVersions: ['2026-07-28'], serverInfo: { name: 'forge', version: '1.0' }, capabilities: { tools: {} } }, id });
         return;
       }
       if (methodRpc === 'initialize') {
@@ -744,7 +744,11 @@ export function createApp(): Server {
               try {
                 const parsed = parseCommit(obj.data);
                 if (parsed.tree) hQueue.push(parsed.tree);
-                for (const pOid of parsed.parents) hQueue.push(pOid);
+                // A shallow boundary's history is NOT held by the client:
+                // include the commit itself (and its tree) but not its parents.
+                if (!requestedShallow.includes(hOid)) {
+                  for (const pOid of parsed.parents) hQueue.push(pOid);
+                }
               } catch {}
             } else if (obj.type === 'tree') {
               try {
@@ -826,7 +830,7 @@ export function createApp(): Server {
         // Sideband band 1 packing
         let offsetPack = 0;
         while (offsetPack < packBytes.length) {
-          const chunkLen = Math.min(packBytes.length - offsetPack, 65516);
+          const chunkLen = Math.min(packBytes.length - offsetPack, 65515);
           const slice = packBytes.subarray(offsetPack, offsetPack + chunkLen);
           const pktLen = (chunkLen + 5).toString(16).padStart(4, '0');
           responseChunks.push(Buffer.concat([Buffer.from(pktLen + '\x01'), slice]));
