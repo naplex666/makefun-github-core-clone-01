@@ -235,58 +235,62 @@ export function packDecode(packBuf: Buffer, externalObjects?: Map<string, { type
       offset += 20;
     }
 
-    // Find zlib stream length using binary search or trial inflate
-    let zlibStreamLen = 1;
+    // Find zlib stream length using single-inflate with info: true (Node 22) or fallback to binary search
     let inflatedData: Buffer | null = null;
+    let bestLen = 0;
 
-    // Binary search max possible remaining length
-    let low = 1;
-    let high = packBuf.length - offset;
-    let bestLen = high;
+    try {
+      const res = zlib.inflateSync(packBuf.subarray(offset), { info: true });
+      if (res && typeof res.engine?.bytesWritten === 'number') {
+        const bl = res.engine.bytesWritten;
+        if (bl >= 1 && offset + bl <= packBuf.length) {
+          const inf = res.buffer;
+          if (typeNum === 6 || typeNum === 7 || inf.length === size) {
+            inflatedData = inf;
+            bestLen = bl;
+          }
+        }
+      }
+    } catch {}
 
-    // Try inflating with increasing lengths or binary search
-    // Since zlib.inflateSync ignores trailing extra bytes if valid zlib stream is found,
-    // we can find the exact length where zlib succeeds and produces expected size (if we know size).
-    // Actually, zlib.inflateSync on a subarray of length L might succeed. We want the smallest L.
-    // Let's do a binary search for L in [1, packBuf.length - offset]:
-    low = 1;
-    high = packBuf.length - offset;
-    while (low <= high) {
-      const mid = (low + high) >> 1;
-      try {
-        const candidate = packBuf.subarray(offset, offset + mid);
-        const inf = zlib.inflateSync(candidate);
-        if (typeNum !== 6 && typeNum !== 7 && inf.length === size) {
-          inflatedData = inf;
-          bestLen = mid;
-          high = mid - 1; // try smaller
-        } else if ((typeNum === 6 || typeNum === 7) && inf.length > 0) {
-          // For delta, size is target size in delta or we just test inflation success
-          inflatedData = inf;
-          bestLen = mid;
-          high = mid - 1;
-        } else {
+    if (!inflatedData) {
+      // Fallback to binary-search block
+      let low = 1;
+      let high = packBuf.length - offset;
+      bestLen = high;
+
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        try {
+          const candidate = packBuf.subarray(offset, offset + mid);
+          const inf = zlib.inflateSync(candidate);
+          if (typeNum !== 6 && typeNum !== 7 && inf.length === size) {
+            inflatedData = inf;
+            bestLen = mid;
+            high = mid - 1; // try smaller
+          } else if ((typeNum === 6 || typeNum === 7) && inf.length > 0) {
+            inflatedData = inf;
+            bestLen = mid;
+            high = mid - 1;
+          } else {
+            low = mid + 1;
+          }
+        } catch {
           low = mid + 1;
         }
-      } catch {
-        low = mid + 1;
+      }
+
+      if (!inflatedData) {
+        try {
+          const inf = zlib.inflateSync(packBuf.subarray(offset));
+          inflatedData = inf;
+          bestLen = packBuf.length - offset;
+        } catch (e) {
+          throw new Error(`Failed to inflate object at offset ${offset}: ${e}`);
+        }
       }
     }
 
-    // If binary search didn't find exact size matching, fallback to scanning or full remaining
-    if (!inflatedData) {
-      try {
-        const inf = zlib.inflateSync(packBuf.subarray(offset));
-        inflatedData = inf;
-        bestLen = packBuf.length - offset; // consume rest or find where zlib ends? zlib consumes what it needs.
-      } catch (e) {
-        throw new Error(`Failed to inflate object at offset ${offset}: ${e}`);
-      }
-    }
-
-    // The binary search above already found the smallest slice that inflates
-    // (zlib.inflateSync ignores trailing bytes and throws on a truncated
-    // stream), so bestLen IS the exact stream length. No linear scan needed.
     const consumed = bestLen;
     offset += consumed;
 
