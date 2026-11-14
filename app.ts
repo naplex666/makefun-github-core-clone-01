@@ -489,8 +489,25 @@ export function createApp(): Server {
             sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Already merged or closed' }], isError: true }, id });
             return;
           }
-          const baseTip = repo.store.refs.get('refs/heads/' + pull.base.ref) || '0000000000000000000000000000000000000000';
-          const headFiles = repo.store.commitFileMap(pull.head.sha);
+          const baseTipNow = repo.store.refs.get('refs/heads/' + pull.base.ref) || '0000000000000000000000000000000000000000';
+          const mergeBaseOid = repo.store.mergeBase(pull.head.sha, baseTipNow);
+          const ancestorFiles = mergeBaseOid ? repo.store.commitFileMap(mergeBaseOid) : new Map<string, Buffer>();
+          const baseCurrentFiles = repo.store.commitFileMap(baseTipNow);
+          const headFiles0 = repo.store.commitFileMap(pull.head.sha);
+          let conflicted = false;
+          for (const p of new Set([...ancestorFiles.keys(), ...baseCurrentFiles.keys(), ...headFiles0.keys()])) {
+            const a = ancestorFiles.get(p);
+            const b = baseCurrentFiles.get(p);
+            const h = headFiles0.get(p);
+            const same = (x?: Buffer, y?: Buffer) => (x === undefined && y === undefined) || (x !== undefined && y !== undefined && x.equals(y));
+            if (!same(h, a) && !same(b, a) && !same(h, b)) { conflicted = true; break; }
+          }
+          if (conflicted) {
+            sendJson(res, 200, { jsonrpc: '2.0', result: { content: [{ type: 'text', text: 'Merge conflict' }], isError: true }, id });
+            return;
+          }
+          const baseTip = baseTipNow;
+          const headFiles = headFiles0;
           const mergeTree = repo.store.writeTreeFromMap(headFiles);
           const commitSha = repo.store.writeCommit(mergeTree, baseTip === '0000000000000000000000000000000000000000' ? [] : [baseTip], `Squash merge PR #${pull.number}: ${pull.title}`);
           repo.store.commitFiles.set(commitSha, new Map(headFiles));
@@ -1595,8 +1612,25 @@ export function createApp(): Server {
                 return;
               }
 
-              const baseTip = repo.store.refs.get('refs/heads/' + pull.base.ref) || '0000000000000000000000000000000000000000';
-              const headFiles = repo.store.commitFileMap(pull.head.sha);
+              const baseTipNow = repo.store.refs.get('refs/heads/' + pull.base.ref) || '0000000000000000000000000000000000000000';
+              const mergeBaseOid = repo.store.mergeBase(pull.head.sha, baseTipNow);
+              const ancestorFiles = mergeBaseOid ? repo.store.commitFileMap(mergeBaseOid) : new Map<string, Buffer>();
+              const baseCurrentFiles = repo.store.commitFileMap(baseTipNow);
+              const headFiles0 = repo.store.commitFileMap(pull.head.sha);
+              let conflicted = false;
+              for (const p of new Set([...ancestorFiles.keys(), ...baseCurrentFiles.keys(), ...headFiles0.keys()])) {
+                const a = ancestorFiles.get(p);
+                const b = baseCurrentFiles.get(p);
+                const h = headFiles0.get(p);
+                const same = (x?: Buffer, y?: Buffer) => (x === undefined && y === undefined) || (x !== undefined && y !== undefined && x.equals(y));
+                if (!same(h, a) && !same(b, a) && !same(h, b)) { conflicted = true; break; }
+              }
+              if (conflicted) {
+                sendJson(res, 405, { message: 'Merge conflict' });
+                return;
+              }
+              const baseTip = baseTipNow;
+              const headFiles = headFiles0;
               const mergeTree = repo.store.writeTreeFromMap(headFiles);
               const commitSha = repo.store.writeCommit(mergeTree, baseTip === '0000000000000000000000000000000000000000' ? [] : [baseTip], `Squash merge PR #${pull.number}: ${pull.title}`);
               repo.store.commitFiles.set(commitSha, new Map(headFiles));
