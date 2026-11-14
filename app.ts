@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
-import { GitRepoStore, parseCommit, sha1Object } from './gitstore.ts';
+import { GitRepoStore, parseCommit, sha1Object, parseTree, packEncode } from './gitstore.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -527,12 +527,41 @@ export function createApp(): Server {
           const pktLine = (str: string) => (str.length + 4).toString(16).padStart(4, '0') + str;
           const header = pktLine(`# service=${service}\n`);
           let refsPkt = '';
-          const headOid = repo.refs.get('refs/heads/' + repo.defaultBranch) || repo.refs.get('HEAD') || '0000000000000000000000000000000000000000';
-          refsPkt += pktLine(`${headOid} HEAD\0symref=HEAD:refs/heads/${repo.defaultBranch} multi_ack side-band-64k ofs-delta agent=git/forge\n`);
-          for (const [refName, oid] of repo.refs.entries()) {
-            if (refName === 'HEAD') continue;
-            refsPkt += pktLine(`${oid} ${refName}\n`);
+          const zeroOid = '0000000000000000000000000000000000000000';
+          const headOid = repo.store.refs.get('refs/heads/' + repo.defaultBranch) || repo.store.refs.get('HEAD') || zeroOid;
+          const caps = 'multi_ack side-band-64k ofs-delta agent=git/forge';
+          const refsEntries = Array.from(repo.store.refs.entries());
+
+          if (refsEntries.length === 0) {
+            refsPkt += pktLine(`${zeroOid} capabilities^{}\0${caps}\n`);
+          } else {
+            let first = true;
+            for (const [refName, oid] of refsEntries) {
+              if (refName === 'HEAD') continue;
+              if (first) {
+                refsPkt += pktLine(`${oid} ${refName}\0symref=HEAD:refs/heads/${repo.defaultBranch} ${caps}\n`);
+                first = false;
+              } else {
+                refsPkt += pktLine(`${oid} ${refName}\n`);
+              }
+              // Check for annotated tag in store
+              const obj = repo.store.objects.get(oid);
+              if (obj && obj.type === 'tag') {
+                try {
+                  const tagText = obj.data.toString('utf8');
+                  const m = tagText.match(/^object\s+([0-9a-f]{40})/m);
+                  if (m) {
+                    refsPkt += pktLine(`${m[1]} ${refName}^{}\n`);
+                  }
+                } catch {}
+              }
+            }
+            if (first) {
+              // Only HEAD was present
+              refsPkt += pktLine(`${headOid} HEAD\0symref=HEAD:refs/heads/${repo.defaultBranch} ${caps}\n`);
+            }
           }
+
           const body = header + '0000' + refsPkt + '0000';
           res.writeHead(200, {
             'content-type': `application/x-${service}-advertisement`,
@@ -545,7 +574,12 @@ export function createApp(): Server {
           const protocolHeader = req.headers['git-protocol'] as string;
           if (protocolHeader?.includes('version=2')) {
             const pktLine = (str: string) => (str.length + 4).toString(16).padStart(4, '0') + str;
-            const body = pktLine('version 2\n') + pktLine('agent=git/forge\n') + '0000';
+            const body = pktLine('version 2\n') +
+                         pktLine('ls-refs=unborn peel symrefs ref-prefix\n') +
+                         pktLine('fetch=shallow filter\n') +
+                         pktLine('agent=git/forge\n') +
+                         pktLine('object-format=sha1\n') +
+                         '0000';
             res.writeHead(200, {
               'content-type': 'application/x-git-upload-pack-advertisement',
               'content-length': Buffer.byteLength(body),
@@ -560,33 +594,222 @@ export function createApp(): Server {
       }
 
       if (action === 'git-upload-pack') {
-        const tipOid = repo.refs.get('refs/heads/' + repo.defaultBranch) || '0000000000000000000000000000000000000000';
-        let packBytes = repo.packCache.get(tipOid);
-        if (!packBytes) {
-          const packHeader = Buffer.alloc(12);
-          packHeader.write('PACK', 0);
-          packHeader.writeUInt32BE(2, 4);
-          packHeader.writeUInt32BE(0, 8);
-          const sha = crypto.createHash('sha1').update(packHeader).digest();
-          packBytes = Buffer.concat([packHeader, sha]);
-          repo.packCache.set(tipOid, packBytes);
-        }
-
-        const sidebandChunks: Buffer[] = [];
-        sidebandChunks.push(Buffer.from('0032ACK ' + tipOid + '\n'));
-        sidebandChunks.push(Buffer.from('0008NAK\n'));
-
+        const reqBuf = await readBody(req);
+        const packets: { kind: 'data' | 'flush' | 'delim' | 'response-end'; payload: Buffer }[] = [];
         let offset = 0;
-        while (offset < packBytes.length) {
-          const chunkLen = Math.min(packBytes.length - offset, 65516);
-          const slice = packBytes.subarray(offset, offset + chunkLen);
-          const pktLen = (chunkLen + 5).toString(16).padStart(4, '0');
-          sidebandChunks.push(Buffer.concat([Buffer.from(pktLen + '\x01'), slice]));
-          offset += chunkLen;
+        while (offset < reqBuf.length) {
+          if (offset + 4 > reqBuf.length) break;
+          const lenHex = reqBuf.subarray(offset, offset + 4).toString('ascii');
+          const len = parseInt(lenHex, 16);
+          if (isNaN(len)) break;
+          offset += 4;
+          if (len === 0) {
+            packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
+          } else if (len === 1) {
+            packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
+          } else if (len === 2) {
+            packets.push({ kind: 'response-end', payload: Buffer.alloc(0) });
+          } else {
+            const dataLen = len - 4;
+            const payload = reqBuf.subarray(offset, offset + dataLen);
+            offset += dataLen;
+            packets.push({ kind: 'data', payload });
+          }
         }
-        sidebandChunks.push(Buffer.from('0000'));
 
-        const responseBuf = Buffer.concat(sidebandChunks);
+        const pktLine = (str: string) => (str.length + 4).toString(16).padStart(4, '0') + str;
+        const zeroOid = '0000000000000000000000000000000000000000';
+
+        // Check if v2 ls-refs command
+        const firstData = packets.find(p => p.kind === 'data');
+        const firstText = firstData ? firstData.payload.toString('utf8').replace(/\n$/, '') : '';
+
+        if (firstText.startsWith('command=ls-refs')) {
+          let peel = false;
+          let symrefs = false;
+          let unborn = false;
+          const refPrefixes: string[] = [];
+          for (const p of packets) {
+            if (p.kind !== 'data') continue;
+            const t = p.payload.toString('utf8').replace(/\n$/, '');
+            if (t === 'peel') peel = true;
+            else if (t === 'symrefs') symrefs = true;
+            else if (t === 'unborn') unborn = true;
+            else if (t.startsWith('ref-prefix ')) refPrefixes.push(t.slice(11).trim());
+          }
+
+          const outChunks: string[] = [];
+          const matchesPrefix = (refName: string) => {
+            if (refPrefixes.length === 0) return true;
+            return refPrefixes.some(pref => refName.startsWith(pref));
+          };
+
+          const defaultBranchRef = 'refs/heads/' + repo.defaultBranch;
+          const headOid = repo.store.refs.get(defaultBranchRef) || repo.store.refs.get('HEAD') || zeroOid;
+
+          // HEAD handling
+          if (matchesPrefix('HEAD')) {
+            let line = `${headOid} HEAD`;
+            if (symrefs) line += ` symref-target:${defaultBranchRef}`;
+            outChunks.push(pktLine(line + '\n'));
+          }
+
+          for (const [refName, oid] of repo.store.refs.entries()) {
+            if (refName === 'HEAD') continue;
+            if (!matchesPrefix(refName)) continue;
+            let line = `${oid} ${refName}`;
+            if (symrefs && refName === defaultBranchRef) line += ` symref-target:${defaultBranchRef}`;
+            if (peel) {
+              const obj = repo.store.objects.get(oid);
+              if (obj && obj.type === 'tag') {
+                try {
+                  const m = obj.data.toString('utf8').match(/^object\s+([0-9a-f]{40})/m);
+                  if (m) line += ` peeled:${m[1]}`;
+                } catch {}
+              }
+            }
+            outChunks.push(pktLine(line + '\n'));
+          }
+
+          outChunks.push('0000');
+          const respBuf = Buffer.from(outChunks.join(''));
+          res.writeHead(200, {
+            'content-type': 'application/x-git-upload-pack-result',
+            'content-length': respBuf.length,
+            'x-github-request-id': nextReqId()
+          });
+          res.end(respBuf);
+          return;
+        }
+
+        // v2 fetch or v0 fetch
+        let wants: string[] = [];
+        let haves: string[] = [];
+        let deepenDepth = 0;
+        let isFetchCommand = firstText.startsWith('command=fetch');
+
+        for (const p of packets) {
+          if (p.kind !== 'data') continue;
+          const t = p.payload.toString('utf8').replace(/\n$/, '');
+          if (t.startsWith('want ')) {
+            const parts = t.slice(5).trim().split(' ');
+            wants.push(parts[0]);
+          } else if (t.startsWith('have ')) {
+            const parts = t.slice(5).trim().split(' ');
+            haves.push(parts[0]);
+          } else if (t.startsWith('deepen ')) {
+            deepenDepth = parseInt(t.slice(7).trim(), 10) || 0;
+          }
+        }
+
+        // Compute object closure
+        const visitedObjects = new Set<string>();
+        const walkQueue = [...wants];
+
+        // If deepenDepth is set, limit commit parent traversal
+        const commitDepths = new Map<string, number>();
+        for (const w of wants) commitDepths.set(w, 1);
+
+        while (walkQueue.length > 0) {
+          const oid = walkQueue.shift()!;
+          if (visitedObjects.has(oid)) continue;
+          const obj = repo.store.objects.get(oid);
+          if (!obj) continue;
+          visitedObjects.add(oid);
+
+          const curDepth = commitDepths.get(oid) || 1;
+
+          if (obj.type === 'commit') {
+            try {
+              const parsed = parseCommit(obj.data);
+              if (parsed.tree) walkQueue.push(parsed.tree);
+              if (deepenDepth === 0 || curDepth < deepenDepth) {
+                for (const pOid of parsed.parents) {
+                  commitDepths.set(pOid, curDepth + 1);
+                  walkQueue.push(pOid);
+                }
+              }
+            } catch {}
+          } else if (obj.type === 'tree') {
+            try {
+              for (const entry of parseTree(obj.data)) {
+                walkQueue.push(entry.oid);
+              }
+            } catch {}
+          } else if (obj.type === 'tag') {
+            try {
+              const m = obj.data.toString('utf8').match(/^object\s+([0-9a-f]{40})/m);
+              if (m) walkQueue.push(m[1]);
+            } catch {}
+          }
+        }
+
+        // Subtract haves if any
+        if (haves.length > 0) {
+          const haveReachable = new Set<string>();
+          const hQueue = [...haves];
+          while (hQueue.length > 0) {
+            const hOid = hQueue.shift()!;
+            if (haveReachable.has(hOid)) continue;
+            haveReachable.add(hOid);
+            const obj = repo.store.objects.get(hOid);
+            if (!obj) continue;
+            if (obj.type === 'commit') {
+              try {
+                const parsed = parseCommit(obj.data);
+                for (const pOid of parsed.parents) hQueue.push(pOid);
+              } catch {}
+            }
+          }
+          for (const hOid of haveReachable) {
+            visitedObjects.delete(hOid);
+          }
+        }
+
+        // Build objects map for packEncode
+        const encodeMap = new Map<string, { type: 'blob' | 'tree' | 'commit' | 'tag'; data: Buffer }>();
+        for (const oid of visitedObjects) {
+          const obj = repo.store.objects.get(oid);
+          if (obj) encodeMap.set(oid, obj);
+        }
+
+        const packBytes = packEncode(encodeMap);
+
+        const responseChunks: Buffer[] = [];
+        // Acknowledgments section
+        if (haves.length > 0) {
+          let acked = false;
+          for (const h of haves) {
+            if (repo.store.objects.has(h)) {
+              responseChunks.push(Buffer.from(pktLine(`ACK ${h}\n`)));
+              acked = true;
+            }
+          }
+          if (!acked) {
+            responseChunks.push(Buffer.from(pktLine('NAK\n')));
+          }
+        } else {
+          responseChunks.push(Buffer.from(pktLine('NAK\n')));
+        }
+
+        if (isFetchCommand) {
+          responseChunks.push(Buffer.from('0001')); // delim for v2 fetch sections
+          // wanted-refs section (optional but nice)
+          // packfile section in sideband band 1
+        }
+
+        // Sideband band 1 packing
+        let offsetPack = 0;
+        while (offsetPack < packBytes.length) {
+          const chunkLen = Math.min(packBytes.length - offsetPack, 65516);
+          const slice = packBytes.subarray(offsetPack, offsetPack + chunkLen);
+          const pktLen = (chunkLen + 5).toString(16).padStart(4, '0');
+          responseChunks.push(Buffer.concat([Buffer.from(pktLen + '\x01'), slice]));
+          offsetPack += chunkLen;
+        }
+        responseChunks.push(Buffer.from('0000')); // flush
+
+        const responseBuf = Buffer.concat(responseChunks);
         res.writeHead(200, {
           'content-type': 'application/x-git-upload-pack-result',
           'content-length': responseBuf.length,
