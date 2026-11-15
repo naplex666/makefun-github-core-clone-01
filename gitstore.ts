@@ -185,7 +185,7 @@ export function packEncode(objects: Map<string, { type: GitObjectType; data: Buf
       headerBytes.push(byte);
     }
     chunks.push(Buffer.from(headerBytes));
-    const compressed = zlib.deflateSync(obj.data);
+    const compressed = zlib.deflateSync(obj.data, { level: 1 });
     chunks.push(compressed);
   }
 
