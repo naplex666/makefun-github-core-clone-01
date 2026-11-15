@@ -777,7 +777,7 @@ export function createApp(): Server {
 
         // The pack for (wants, haves, deepen) is deterministic and immutable,
         // so cache it: 50 shallow clones of one tip share one pack build.
-        const cacheKey = [...wants].sort().join(',') + '|' + [...haves].sort().join(',') + '|d' + deepenDepth;
+        const cacheKey = [...wants].sort().join(',') + '|' + [...haves].sort().join(',') + '|d' + deepenDepth + '|s' + [...requestedShallow].sort().join(',');
         const allWantsPresent = wants.length > 0 && wants.every((w: string) => repo.store.objects.has(w));
         let packBytes = allWantsPresent ? repo.store.packCache.get(cacheKey) : undefined;
         if (!packBytes) {
