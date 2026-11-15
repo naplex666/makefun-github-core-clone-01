@@ -204,6 +204,8 @@ export function packDecode(packBuf: Buffer, externalObjects?: Map<string, { type
 
   // We need to keep track of objects in this pack for OFS_DELTA
   const decodedInPack: { type: GitObjectType; data: Buffer; offset: number }[] = [];
+  const decodedByOffset = new Map<number, { type: GitObjectType; data: Buffer }>();
+  const pendingRefDeltas: { refOid: string; deltaData: Buffer; objStartOffset: number; typeNum: number }[] = [];
 
   for (let i = 0; i < numObjects; i++) {
     const objStartOffset = offset;
@@ -303,7 +305,7 @@ export function packDecode(packBuf: Buffer, externalObjects?: Map<string, { type
     else if (typeNum === 4) { finalType = 'tag'; finalData = inflatedData!; }
     else if (typeNum === 6) {
       // OFS_DELTA
-      const baseObj = decodedInPack.find(o => o.offset === baseOffset);
+      const baseObj = decodedByOffset.get(baseOffset!);
       if (!baseObj) throw new Error(`Base object at offset ${baseOffset} not found for OFS_DELTA`);
       finalData = applyDelta(baseObj.data, inflatedData!);
       finalType = baseObj.type;
@@ -320,7 +322,10 @@ export function packDecode(packBuf: Buffer, externalObjects?: Map<string, { type
           }
         }
       }
-      if (!base) throw new Error(`Base object ${refOid} not found for REF_DELTA`);
+      if (!base) {
+        pendingRefDeltas.push({ refOid: refOid!, deltaData: inflatedData!, objStartOffset, typeNum });
+        continue;
+      }
       finalData = applyDelta(base.data, inflatedData!);
       finalType = base.type;
     }
@@ -328,6 +333,41 @@ export function packDecode(packBuf: Buffer, externalObjects?: Map<string, { type
     const oid = sha1Object(finalType, finalData);
     result.set(oid, { type: finalType, data: finalData });
     decodedInPack.push({ type: finalType, data: finalData, offset: objStartOffset });
+    decodedByOffset.set(objStartOffset, { type: finalType, data: finalData });
+  }
+
+  // Resolve pending REF_DELTAs iteratively
+  let progress = true;
+  while (pendingRefDeltas.length > 0 && progress) {
+    progress = false;
+    for (let i = pendingRefDeltas.length - 1; i >= 0; i--) {
+      const p = pendingRefDeltas[i];
+      let base = result.get(p.refOid) || externalObjects?.get(p.refOid);
+      if (!base) {
+        for (const d of decodedInPack) {
+          const oid = sha1Object(d.type, d.data);
+          if (oid === p.refOid) {
+            base = d;
+            break;
+          }
+        }
+      }
+      if (base) {
+        const finalData = applyDelta(base.data, p.deltaData);
+        const finalType = base.type;
+        const oid = sha1Object(finalType, finalData);
+        result.set(oid, { type: finalType, data: finalData });
+        decodedInPack.push({ type: finalType, data: finalData, offset: p.objStartOffset });
+        decodedByOffset.set(p.objStartOffset, { type: finalType, data: finalData });
+        pendingRefDeltas.splice(i, 1);
+        progress = true;
+      }
+    }
+  }
+
+  if (pendingRefDeltas.length > 0) {
+    const p = pendingRefDeltas[0];
+    throw new Error(`Base object ${p.refOid} not found for REF_DELTA`);
   }
 
   return result;
