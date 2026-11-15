@@ -881,44 +881,64 @@ export function createApp(): Server {
         }
 
         // Store the pack that follows the command-list flush packet (if any).
-        try {
-          const packBytes = reqBuf.subarray(offset);
-          if (packBytes.length >= 12 && packBytes.subarray(0, 4).toString('ascii') === 'PACK') {
+        let unpackErr: string | null = null;
+        const packBytes = reqBuf.subarray(offset);
+        const hasPack = packBytes.length >= 12 && packBytes.subarray(0, 4).toString('ascii') === 'PACK';
+        if (hasPack) {
+          try {
             const decoded = packDecode(packBytes, repo.store.objects);
             for (const [oid, obj] of decoded) repo.store.objects.set(oid, obj);
+          } catch (e: any) {
+            unpackErr = e?.message || String(e);
           }
-        } catch {}
+        }
 
-        const reportLines: string[] = ['unpack ok\n'];
-        for (const cmd of commands) {
-          const zeroOid = '0000000000000000000000000000000000000000';
-          const currentOid = repo.store.refs.get(cmd.refName) || zeroOid;
-          const isDelete = cmd.newOid === zeroOid;
-          const isCreate = cmd.oldOid === zeroOid;
-          if (isDelete) {
-            if (currentOid === zeroOid || currentOid !== cmd.oldOid) {
+        const reportLines: string[] = [];
+        if (unpackErr) {
+          reportLines.push(`unpack ${unpackErr}\n`);
+          for (const cmd of commands) {
+            reportLines.push(`ng ${cmd.refName} unpack failed\n`);
+          }
+        } else {
+          if (hasPack) {
+            reportLines.push('unpack ok\n');
+          } else {
+            reportLines.push('unpack ok\n');
+          }
+          for (const cmd of commands) {
+            const zeroOid = '0000000000000000000000000000000000000000';
+            const currentOid = repo.store.refs.get(cmd.refName) || zeroOid;
+            const isDelete = cmd.newOid === zeroOid;
+            const isCreate = cmd.oldOid === zeroOid;
+            if (isDelete) {
+              if (currentOid === zeroOid || currentOid !== cmd.oldOid) {
+                reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
+              } else {
+                repo.store.refs.delete(cmd.refName);
+                if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.delete(cmd.refName.replace('refs/heads/', ''));
+                reportLines.push(`ok ${cmd.refName}\n`);
+              }
+            } else if (isCreate) {
+              if (currentOid !== zeroOid) {
+                reportLines.push(`ng ${cmd.refName} already exists\n`);
+              } else if (!repo.store.objects.has(cmd.newOid)) {
+                reportLines.push(`ng ${cmd.refName} missing object\n`);
+              } else {
+                repo.store.refs.set(cmd.refName, cmd.newOid);
+                if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.set(cmd.refName.replace('refs/heads/', ''), repo.store.commitFileMap(cmd.newOid));
+                reportLines.push(`ok ${cmd.refName}\n`);
+              }
+            } else if (currentOid !== cmd.oldOid) {
               reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
-            } else {
-              repo.store.refs.delete(cmd.refName);
-              if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.delete(cmd.refName.replace('refs/heads/', ''));
-              reportLines.push(`ok ${cmd.refName}\n`);
-            }
-          } else if (isCreate) {
-            if (currentOid !== zeroOid) {
-              reportLines.push(`ng ${cmd.refName} already exists\n`);
+            } else if (!repo.store.isAncestor(cmd.newOid, cmd.oldOid)) {
+              reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
+            } else if (!repo.store.objects.has(cmd.newOid)) {
+              reportLines.push(`ng ${cmd.refName} missing object\n`);
             } else {
               repo.store.refs.set(cmd.refName, cmd.newOid);
               if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.set(cmd.refName.replace('refs/heads/', ''), repo.store.commitFileMap(cmd.newOid));
               reportLines.push(`ok ${cmd.refName}\n`);
             }
-          } else if (currentOid !== cmd.oldOid) {
-            reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
-          } else if (!repo.store.isAncestor(cmd.newOid, cmd.oldOid)) {
-            reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
-          } else {
-            repo.store.refs.set(cmd.refName, cmd.newOid);
-            if (cmd.refName.startsWith('refs/heads/')) repo.store.branchFiles.set(cmd.refName.replace('refs/heads/', ''), repo.store.commitFileMap(cmd.newOid));
-            reportLines.push(`ok ${cmd.refName}\n`);
           }
         }
 
