@@ -378,7 +378,7 @@ export class GitRepoStore {
   refs = new Map<string, string>(); // refname -> oid
   branchFiles = new Map<string, Map<string, Buffer>>(); // branch -> (path -> content Buffer)
   commitFiles = new Map<string, Map<string, Buffer>>(); // commitOid -> (path -> content Buffer)
-  packCache = new Map<string, Buffer>();
+  packCache = new Map<string, { pack: Buffer; shallowOids: string[]; unshallowOids: string[] }>();
 
   writeObject(type: GitObjectType, data: Buffer): string {
     const oid = sha1Object(type, data);

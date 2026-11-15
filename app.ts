@@ -687,6 +687,16 @@ export function createApp(): Server {
           }
         }
 
+        // Early cache check (fix #4): the key is computable from the parsed
+        // request alone, so a hit skips both walks + encodeMap.
+        const cacheKey = [...wants].sort().join(',') + '|' + [...haves].sort().join(',') + '|d' + deepenDepth + '|s' + [...requestedShallow].sort().join(',');
+        const allWantsPresent = wants.length > 0 && wants.every((w: string) => repo.store.objects.has(w));
+        const cachedPack = allWantsPresent ? repo.store.packCache.get(cacheKey) : undefined;
+        let packBytes: Buffer | undefined = cachedPack?.pack;
+        let shallowOids: string[] = cachedPack?.shallowOids ?? [];
+        let unshallowOids: string[] = cachedPack?.unshallowOids ?? [];
+        if (!cachedPack) {
+
         // Compute object closure
         const visitedObjects = new Set<string>();
         const walkQueue = [...wants];
@@ -777,13 +787,25 @@ export function createApp(): Server {
 
         // The pack for (wants, haves, deepen) is deterministic and immutable,
         // so cache it: 50 shallow clones of one tip share one pack build.
-        const cacheKey = [...wants].sort().join(',') + '|' + [...haves].sort().join(',') + '|d' + deepenDepth + '|s' + [...requestedShallow].sort().join(',');
-        const allWantsPresent = wants.length > 0 && wants.every((w: string) => repo.store.objects.has(w));
-        let packBytes = allWantsPresent ? repo.store.packCache.get(cacheKey) : undefined;
-        if (!packBytes) {
           packBytes = packEncode(encodeMap);
-          if (allWantsPresent) repo.store.packCache.set(cacheKey, packBytes);
-        }
+          // Derive shallow/unshallow from this walk (same logic as the
+          // response block below) so a later hit can skip the walks.
+          for (const [oid, depth] of commitDepths) {
+            if (depth === deepenDepth && visitedObjects.has(oid)) {
+              const obj = repo.store.objects.get(oid);
+              if (obj && obj.type === 'commit') shallowOids.push(oid);
+            }
+          }
+          for (const s of requestedShallow) {
+            const obj = repo.store.objects.get(s);
+            if (!obj || obj.type !== 'commit') continue;
+            try {
+              const parsed = parseCommit(obj.data);
+              if (parsed.parents.some((p: string) => visitedObjects.has(p))) unshallowOids.push(s);
+            } catch {}
+          }
+          if (allWantsPresent) repo.store.packCache.set(cacheKey, { pack: packBytes, shallowOids, unshallowOids });
+        } // end if (!cachedPack)
 
         const responseChunks: Buffer[] = [];
         if (isFetchCommand) {
@@ -808,22 +830,13 @@ export function createApp(): Server {
           responseChunks.push(Buffer.from('0001')); // delim: end of acknowledgments
           if (deepenDepth > 0) {
             responseChunks.push(Buffer.from(pktLine('shallow-info\n')));
-            // Boundary commits: the ones at exactly the deepen depth (their
-            // parents were cut off). commitDepths was built during the walk.
-            for (const [oid, depth] of commitDepths) {
-              if (depth === deepenDepth && visitedObjects.has(oid)) {
-                const obj = repo.store.objects.get(oid);
-                if (obj && obj.type === 'commit') responseChunks.push(Buffer.from(pktLine(`shallow ${oid}\n`)));
-              }
+            // Boundary commits + unshallow come from the walk, or from the
+            // cache on a hit (fix #4) — same bytes either way.
+            for (const oid of shallowOids) {
+              responseChunks.push(Buffer.from(pktLine(`shallow ${oid}\n`)));
             }
-            // Unshallow: a previously-shallow commit whose parent we delivered.
-            for (const s of requestedShallow) {
-              const obj = repo.store.objects.get(s);
-              if (!obj || obj.type !== 'commit') continue;
-              try {
-                const parsed = parseCommit(obj.data);
-                if (parsed.parents.some((p: string) => visitedObjects.has(p))) responseChunks.push(Buffer.from(pktLine(`unshallow ${s}\n`)));
-              } catch {}
+            for (const s of unshallowOids) {
+              responseChunks.push(Buffer.from(pktLine(`unshallow ${s}\n`)));
             }
             responseChunks.push(Buffer.from('0001')); // delim: end of shallow-info
           }
